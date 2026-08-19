@@ -92,6 +92,13 @@ import json
 import random
 import string
 import textwrap
+import secrets
+import binascii
+import csv
+import base64
+import hashlib
+import io
+import pickle
 import datetime as dt
 from collections import Counter, defaultdict
 
@@ -139,7 +146,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.pipeline import FeatureUnion
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import KMeans
-from sklearn.neural_network import MLPClassifier
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -334,7 +341,7 @@ class Database:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(self.db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._init_schema()
@@ -22820,6 +22827,3375 @@ TOPIC_LAUNCHER_ALIASES = {
 # ==============================================================================
 # SECTION 9: MAIN CHATBOT CLASS
 # ==============================================================================
+
+
+
+# =============================================================================
+# MERGED-IN FEATURES: utility tools, API connectors, tone/context tracking,
+# and lightweight classifiers, ported over from the fuller modular version of
+# this project. Everything below is self-contained and uses only what's
+# already imported above (sklearn's MLPClassifier/MLPRegressor as the torch
+# fallback, PIL for image handling, urllib for the API connectors) - nothing
+# here requires torch, tensorflow, or chromadb.
+# =============================================================================
+
+
+# --- MODEL_CACHE_DIR, model_cache_key, load_cached_model, save_cached_model (support, from 01_config_and_db.py) ---
+MODEL_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_cache")
+
+
+def model_cache_key(*parts) -> str:
+    hasher = hashlib.sha256()
+    for part in parts:
+        hasher.update(repr(part).encode("utf-8"))
+    return hasher.hexdigest()[:20]
+
+
+def load_cached_model(cache_key: str):
+    """Returns the cached dict of fitted attributes, or None if no
+    cache exists yet, or it can't be read for any reason - fails
+    closed to retraining rather than ever crashing startup."""
+    path = os.path.join(MODEL_CACHE_DIR, f"{cache_key}.pkl")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def save_cached_model(cache_key: str, data: dict):
+    """Saves the dict of fitted attributes to the cache - best-effort
+    and silent on failure (e.g. read-only filesystem), since a caching
+    failure should never break training that already succeeded."""
+    try:
+        os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+        path = os.path.join(MODEL_CACHE_DIR, f"{cache_key}.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+    except Exception:
+        pass
+
+
+
+# --- _MOOD_TRANSITION_WEIGHTS (support3, from 10_neural_networks.py) ---
+_MOOD_TRANSITION_WEIGHTS = {
+    "positive": {"positive": 7, "neutral": 2, "negative": 1},
+    "neutral": {"positive": 3, "neutral": 4, "negative": 3},
+    "negative": {"positive": 1, "neutral": 3, "negative": 6},
+}
+
+
+# --- _ORDER (support3, from 27_name_generator.py) ---
+_ORDER = 2       # how many previous characters condition the next one
+
+
+# --- _END (support3, from 27_name_generator.py) ---
+_END = "\0"      # sentinel marking "name ends here"
+
+
+# --- _DeepDenseTextClassifier (support, from 32_deep_networks.py) ---
+class _DeepDenseTextClassifier:
+    """
+    Shared scaffolding for the four CLASSIFICATION networks in this
+    section (urgency/politeness/question-type/emoji) - word-level
+    mean-pooled embeddings through a deep 5-layer dense stack, softmax
+    head. Deliberately simpler than _BaseNeuralClassifier (Section 6G):
+    no user-correction/online-retraining machinery, since these five
+    networks are fit once from a fixed dataset and aren't wired into
+    the "no, i meant..." correction flow the way intent/sentiment are.
+    """
+
+    EMBED_DIM = 32
+    HIDDEN_DIMS = (64, 64, 48, 32, 16)  # 5 hidden layers - "many and dense", narrowed
+    # from an initial (128,128,96,64,32) after measurement showed that
+    # width (not depth) was overfitting these ~40-70-example datasets -
+    # 5 layers stayed, per an explicit request for depth, but each
+    # layer has fewer units so there are fewer parameters overall.
+    MAX_EPOCHS = 120
+    EARLY_STOP_PATIENCE = 15
+    VAL_FRACTION = 0.2
+
+    def __init__(self, examples):
+        self.examples = list(examples)
+        self.backend = "torch" if TORCH_AVAILABLE else "sklearn"
+        self.vocab = None
+        self.vectorizer = None
+        self.label_list = []
+        self.label_to_idx = {}
+        self.model = None
+        self.last_val_accuracy = None
+        self.last_training_info = None
+        self._fit()
+
+    def _split(self, X, y):
+        try:
+            return train_test_split(X, y, test_size=self.VAL_FRACTION, random_state=42, stratify=y)
+        except ValueError:
+            # A label with only 1 example can't be stratified - fall
+            # back to a plain (non-stratified) split rather than crash.
+            return train_test_split(X, y, test_size=self.VAL_FRACTION, random_state=42)
+
+    def _fit(self):
+        texts = [t for t, _l in self.examples]
+        labels = [l for _t, l in self.examples]
+        self.label_list = sorted(set(labels))
+        self.label_to_idx = {l: i for i, l in enumerate(self.label_list)}
+
+        if self.backend == "torch":
+            self._fit_torch(texts, labels)
+        else:
+            self._fit_sklearn(texts, labels)
+
+    def _build_torch_model(self, vocab_size, num_classes):
+        embed_dim = self.EMBED_DIM
+        hidden_dims = self.HIDDEN_DIMS
+
+        class _DeepDenseNet(nn.Module):
+            """Mean-pooled word embeddings -> 5 stacked Linear+
+            BatchNorm1d+GELU+Dropout layers -> Linear head. Every
+            hidden layer is followed by normalization and dropout so
+            the extra depth is regularized, the same lesson
+            NeuralIntentClassifier's _ResidualBlock design already
+            demonstrated (though this one uses plain stacking rather
+            than skip connections, since a 5-layer plain stack is
+            still well within what these dataset sizes can support -
+            skip connections start earning their complexity cost at
+            greater depths than five layers)."""
+
+            def __init__(self):
+                super().__init__()
+                self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+                layers = []
+                prev_dim = embed_dim
+                for h in hidden_dims:
+                    layers.append(nn.Linear(prev_dim, h))
+                    layers.append(nn.BatchNorm1d(h))
+                    layers.append(nn.GELU())
+                    layers.append(nn.Dropout(0.3))
+                    prev_dim = h
+                self.stack = nn.Sequential(*layers)
+                self.head = nn.Linear(prev_dim, num_classes)
+
+            @staticmethod
+            def _mean_pool(embedded, token_ids):
+                mask = (token_ids != 0).unsqueeze(-1).float()
+                summed = (embedded * mask).sum(dim=1)
+                counts = mask.sum(dim=1).clamp(min=1.0)
+                return summed / counts
+
+            def forward(self, token_ids):
+                pooled = self._mean_pool(self.embedding(token_ids), token_ids)
+                h = self.stack(pooled)
+                return self.head(h)
+
+        torch.manual_seed(42)
+        return _DeepDenseNet()
+
+    def _fit_torch(self, texts, labels):
+        self.vocab = _TextVocab(texts, max_len=16)
+        y = [self.label_to_idx[l] for l in labels]
+        X_ids = [self.vocab.encode(t) for t in texts]
+
+        X_train, X_val, y_train, y_val = self._split(X_ids, y)
+        model = self._build_torch_model(len(self.vocab), len(self.label_list))
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+        criterion = nn.CrossEntropyLoss()
+
+        X_train_t = torch.tensor(X_train, dtype=torch.long)
+        y_train_t = torch.tensor(y_train, dtype=torch.long)
+        X_val_t = torch.tensor(X_val, dtype=torch.long)
+        y_val_t = torch.tensor(y_val, dtype=torch.long)
+
+        best_val_acc, best_state, patience_left = -1.0, None, self.EARLY_STOP_PATIENCE
+        for epoch in range(self.MAX_EPOCHS):
+            model.train()
+            optimizer.zero_grad()
+            logits = model(X_train_t)
+            loss = criterion(logits, y_train_t)
+            loss.backward()
+            optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_logits = model(X_val_t)
+                val_preds = val_logits.argmax(dim=1)
+                val_acc = (val_preds == y_val_t).float().mean().item()
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                patience_left = self.EARLY_STOP_PATIENCE
+            else:
+                patience_left -= 1
+                if patience_left <= 0:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        model.eval()
+        self.model = model
+        self.last_val_accuracy = best_val_acc
+        self.last_training_info = {
+            "backend": "torch", "architecture": f"embedding -> {len(self.HIDDEN_DIMS)} dense layers -> softmax",
+            "val_accuracy": round(best_val_acc, 3), "train_examples": len(X_train), "val_examples": len(X_val),
+        }
+
+    def _fit_sklearn(self, texts, labels):
+        cache_key = model_cache_key(
+            type(self).__name__ + "_sklearn_v1", texts, labels, self.HIDDEN_DIMS,
+        )
+        cached = load_cached_model(cache_key)
+        if cached is not None:
+            self.vectorizer = cached["vectorizer"]
+            self.model = cached["model"]
+            self.last_val_accuracy = cached["last_val_accuracy"]
+            self.last_training_info = cached["last_training_info"]
+            return
+
+        # min_df=2 + max_features=200 (rather than the unbounded
+        # min_df=1 first used here): measured against these datasets,
+        # unbounded TF-IDF gave ~620 features for ~100 examples - more
+        # input dimensions than training rows, which was very likely
+        # the dominant cause of the poor validation accuracy (worse
+        # than the layer-width/depth choice). Dropping singleton terms
+        # and capping vocabulary shrinks that to a far saner ratio.
+        self.vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=200)
+        X = self.vectorizer.fit_transform(texts).toarray()
+        y = [self.label_to_idx[l] for l in labels]
+
+        X_train, X_val, y_train, y_val = self._split(X, y)
+        # Same 5-layer depth as the torch side, translated to sklearn's
+        # hidden_layer_sizes tuple - no skip connections available here,
+        # so this is more overfitting-prone on small data (same caveat
+        # documented for the intent/sentiment sklearn fallbacks).
+        model = MLPClassifier(
+            hidden_layer_sizes=self.HIDDEN_DIMS, activation="relu", alpha=0.03,
+            max_iter=2000, random_state=42, early_stopping=False, n_iter_no_change=50,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=ConvergenceWarning)
+            model.fit(X_train, y_train)
+
+        val_acc = accuracy_score(y_val, model.predict(X_val)) if len(y_val) else None
+        self.model = model
+        self.last_val_accuracy = val_acc
+        self.last_training_info = {
+            "backend": "sklearn", "architecture": f"TF-IDF -> MLPClassifier{self.HIDDEN_DIMS}",
+            "val_accuracy": round(val_acc, 3) if val_acc is not None else None,
+            "train_examples": len(X_train), "val_examples": len(X_val),
+        }
+        save_cached_model(cache_key, {
+            "vectorizer": self.vectorizer, "model": self.model,
+            "last_val_accuracy": self.last_val_accuracy, "last_training_info": self.last_training_info,
+        })
+
+    def predict(self, text: str):
+        """Returns (label, confidence)."""
+        if self.backend == "torch":
+            ids = torch.tensor([self.vocab.encode(text)], dtype=torch.long)
+            self.model.eval()
+            with torch.no_grad():
+                probs = torch.softmax(self.model(ids), dim=1)[0]
+            idx = int(torch.argmax(probs))
+            return self.label_list[idx], float(probs[idx])
+        else:
+            X = self.vectorizer.transform([text]).toarray()
+            probs = self.model.predict_proba(X)[0]
+            idx = int(np.argmax(probs))
+            return self.label_list[idx], float(probs[idx])
+
+
+# --- _DeepDenseTextRegressor (support, from 32_deep_networks.py) ---
+class _DeepDenseTextRegressor:
+    """
+    Regression counterpart to _DeepDenseTextClassifier: same 5-layer
+    deep dense stack over mean-pooled word embeddings, but a single
+    linear (sigmoid-bounded) output unit trained with MSE loss instead
+    of a softmax head trained with cross-entropy - a genuinely
+    different training objective/task TYPE, not just a differently
+    labeled classifier. Used by TextComplexityRegressor.
+    """
+
+    EMBED_DIM = 32
+    HIDDEN_DIMS = (64, 64, 48, 32, 16)
+    MAX_EPOCHS = 150
+    EARLY_STOP_PATIENCE = 20
+    VAL_FRACTION = 0.2
+
+    def __init__(self, examples):
+        self.examples = list(examples)  # (text, float_target_in_0_1)
+        self.backend = "torch" if TORCH_AVAILABLE else "sklearn"
+        self.vocab = None
+        self.vectorizer = None
+        self.model = None
+        self.last_val_mae = None
+        self.last_training_info = None
+        self._fit()
+
+    def _fit(self):
+        texts = [t for t, _s in self.examples]
+        scores = [s for _t, s in self.examples]
+        if self.backend == "torch":
+            self._fit_torch(texts, scores)
+        else:
+            self._fit_sklearn(texts, scores)
+
+    def _build_torch_model(self, vocab_size):
+        embed_dim, hidden_dims = self.EMBED_DIM, self.HIDDEN_DIMS
+
+        class _DeepDenseRegressionNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+                layers = []
+                prev_dim = embed_dim
+                for h in hidden_dims:
+                    layers.append(nn.Linear(prev_dim, h))
+                    layers.append(nn.BatchNorm1d(h))
+                    layers.append(nn.GELU())
+                    layers.append(nn.Dropout(0.3))
+                    prev_dim = h
+                self.stack = nn.Sequential(*layers)
+                self.head = nn.Linear(prev_dim, 1)
+
+            @staticmethod
+            def _mean_pool(embedded, token_ids):
+                mask = (token_ids != 0).unsqueeze(-1).float()
+                summed = (embedded * mask).sum(dim=1)
+                counts = mask.sum(dim=1).clamp(min=1.0)
+                return summed / counts
+
+            def forward(self, token_ids):
+                pooled = self._mean_pool(self.embedding(token_ids), token_ids)
+                h = self.stack(pooled)
+                return torch.sigmoid(self.head(h)).squeeze(-1)  # bounded to (0, 1)
+
+        torch.manual_seed(42)
+        return _DeepDenseRegressionNet()
+
+    def _fit_torch(self, texts, scores):
+        self.vocab = _TextVocab(texts, max_len=20)
+        X_ids = [self.vocab.encode(t) for t in texts]
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_ids, scores, test_size=self.VAL_FRACTION, random_state=42
+        )
+
+        model = self._build_torch_model(len(self.vocab))
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+        criterion = nn.MSELoss()
+
+        X_train_t = torch.tensor(X_train, dtype=torch.long)
+        y_train_t = torch.tensor(y_train, dtype=torch.float32)
+        X_val_t = torch.tensor(X_val, dtype=torch.long)
+        y_val_t = torch.tensor(y_val, dtype=torch.float32)
+
+        best_val_mae, best_state, patience_left = float("inf"), None, self.EARLY_STOP_PATIENCE
+        for epoch in range(self.MAX_EPOCHS):
+            model.train()
+            optimizer.zero_grad()
+            preds = model(X_train_t)
+            loss = criterion(preds, y_train_t)
+            loss.backward()
+            optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_preds = model(X_val_t)
+                val_mae = (val_preds - y_val_t).abs().mean().item()
+
+            if val_mae < best_val_mae:
+                best_val_mae = val_mae
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                patience_left = self.EARLY_STOP_PATIENCE
+            else:
+                patience_left -= 1
+                if patience_left <= 0:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        model.eval()
+        self.model = model
+        self.last_val_mae = best_val_mae
+        self.last_training_info = {
+            "backend": "torch", "architecture": f"embedding -> {len(self.HIDDEN_DIMS)} dense layers -> sigmoid",
+            "val_mae": round(best_val_mae, 4), "train_examples": len(X_train), "val_examples": len(X_val),
+        }
+
+    def _fit_sklearn(self, texts, scores):
+        cache_key = model_cache_key(type(self).__name__ + "_sklearn_v1", texts, scores, self.HIDDEN_DIMS)
+        cached = load_cached_model(cache_key)
+        if cached is not None:
+            self.vectorizer = cached["vectorizer"]
+            self.model = cached["model"]
+            self.last_val_mae = cached["last_val_mae"]
+            self.last_training_info = cached["last_training_info"]
+            return
+
+        # Same dimensionality fix as _DeepDenseTextClassifier - see the
+        # comment there.
+        self.vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=200)
+        X = self.vectorizer.fit_transform(texts).toarray()
+        X_train, X_val, y_train, y_val = train_test_split(X, scores, test_size=self.VAL_FRACTION, random_state=42)
+
+        model = MLPRegressor(
+            hidden_layer_sizes=self.HIDDEN_DIMS, activation="relu", alpha=0.03,
+            max_iter=2000, random_state=42, early_stopping=False, n_iter_no_change=50,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=ConvergenceWarning)
+            model.fit(X_train, y_train)
+
+        val_preds = np.clip(model.predict(X_val), 0.0, 1.0)
+        val_mae = float(np.mean(np.abs(val_preds - np.array(y_val)))) if len(y_val) else None
+        self.model = model
+        self.last_val_mae = val_mae
+        self.last_training_info = {
+            "backend": "sklearn", "architecture": f"TF-IDF -> MLPRegressor{self.HIDDEN_DIMS}",
+            "val_mae": round(val_mae, 4) if val_mae is not None else None,
+            "train_examples": len(X_train), "val_examples": len(X_val),
+        }
+        save_cached_model(cache_key, {
+            "vectorizer": self.vectorizer, "model": self.model,
+            "last_val_mae": self.last_val_mae, "last_training_info": self.last_training_info,
+        })
+
+    def predict(self, text: str) -> float:
+        if self.backend == "torch":
+            ids = torch.tensor([self.vocab.encode(text)], dtype=torch.long)
+            self.model.eval()
+            with torch.no_grad():
+                score = float(self.model(ids)[0])
+            return max(0.0, min(1.0, score))
+        else:
+            X = self.vectorizer.transform([text]).toarray()
+            return float(np.clip(self.model.predict(X)[0], 0.0, 1.0))
+
+
+# --- URGENCY_EXAMPLES (support, from 32_deep_networks.py) ---
+URGENCY_EXAMPLES = [
+    ("call an ambulance right now", "high"),
+    ("the building is on fire, get out", "high"),
+    ("i need help immediately, this can't wait", "high"),
+    ("this is a genuine emergency", "high"),
+    ("please respond right away, it's extremely urgent", "high"),
+    ("drop everything, we have a crisis on our hands", "high"),
+    ("asap, the production server just went down", "high"),
+    ("act now before it's too late", "high"),
+    ("emergency, someone is missing", "high"),
+    ("hurry, we're rapidly running out of time", "high"),
+    ("this needs to happen this second, no delays", "high"),
+    ("critical failure, everything is down right now", "high"),
+    ("i'm panicking, please help me right now", "high"),
+    ("the deadline is in ten minutes and nothing is ready", "high"),
+    ("mayday, we need immediate assistance", "high"),
+    ("can you get back to me sometime today", "medium"),
+    ("i'd like this wrapped up by tomorrow", "medium"),
+    ("this needs some attention pretty soon", "medium"),
+    ("let's resolve this by the end of the week", "medium"),
+    ("please follow up when you can, maybe this week", "medium"),
+    ("it's not an emergency but it should be handled soon", "medium"),
+    ("this is somewhat time sensitive", "medium"),
+    ("i'd appreciate a reply in the next day or two", "medium"),
+    ("we should probably sort this out before friday", "medium"),
+    ("no huge rush, but don't let it sit too long", "medium"),
+    ("this is a moderate priority item", "medium"),
+    ("try to get to this within the next couple days", "medium"),
+    ("whenever you get a chance is fine", "low"),
+    ("no rush at all, take your time", "low"),
+    ("this can wait as long as it needs to", "low"),
+    ("just a casual question, absolutely no hurry", "low"),
+    ("not time sensitive, just curious about it", "low"),
+    ("someday it'd be nice to look into this", "low"),
+    ("low priority, feel free to set it aside", "low"),
+    ("purely for fun, no deadline whatsoever", "low"),
+    ("whenever is convenient for you works", "low"),
+    ("this has been sitting for months, no urgency", "low"),
+]
+
+
+# --- POLITENESS_EXAMPLES (support, from 32_deep_networks.py) ---
+POLITENESS_EXAMPLES = [
+    ("would you mind helping me with this, please", "polite"),
+    ("i'd really appreciate your assistance if possible", "polite"),
+    ("thank you so much for your time and patience", "polite"),
+    ("excuse me, could you possibly help me out", "polite"),
+    ("i'm sorry to bother you, but could i ask something", "polite"),
+    ("please let me know whenever is convenient for you", "polite"),
+    ("many thanks in advance for your help", "polite"),
+    ("i hope this isn't too much trouble to ask", "polite"),
+    ("would it be alright if i asked a favor", "polite"),
+    ("i truly appreciate you taking the time", "polite"),
+    ("if it's not too much bother, could you check this", "polite"),
+    ("thanks a ton, you've been wonderfully helpful", "polite"),
+    ("i'd be grateful for any guidance you can offer", "polite"),
+    ("pardon the interruption, may i ask a quick question", "polite"),
+    ("send me the file when you have a moment", "neutral"),
+    ("what time is the meeting scheduled for", "neutral"),
+    ("here's the report you asked about", "neutral"),
+    ("i need the updated numbers", "neutral"),
+    ("list the steps for this process", "neutral"),
+    ("give me an update on the project", "neutral"),
+    ("the document is attached below", "neutral"),
+    ("confirm the appointment for tuesday", "neutral"),
+    ("forward this message to the team", "neutral"),
+    ("check the inventory count please", "neutral"),
+    ("update the spreadsheet with today's totals", "neutral"),
+    ("schedule the call for next week", "neutral"),
+    ("just do it already, i don't have time for this", "rude"),
+    ("why is this so slow, fix it right now", "rude"),
+    ("stop wasting my time with excuses", "rude"),
+    ("this is useless, do better next time", "rude"),
+    ("quit stalling and just answer me", "rude"),
+    ("you clearly have no idea what you're doing", "rude"),
+    ("hurry up, i don't have all day for this", "rude"),
+    ("this is a joke, get your act together", "rude"),
+    ("i'm sick of your incompetence honestly", "rude"),
+    ("just shut up and fix the problem", "rude"),
+    ("are you even listening to me at all", "rude"),
+    ("this is pathetic, try harder", "rude"),
+]
+
+
+# --- QUESTION_TYPE_EXAMPLES (support, from 32_deep_networks.py) ---
+QUESTION_TYPE_EXAMPLES = [
+    ("is this correct", "yes_no"),
+    ("did you finish the report", "yes_no"),
+    ("can you help me with this", "yes_no"),
+    ("will it rain tomorrow", "yes_no"),
+    ("do you like coffee", "yes_no"),
+    ("are we meeting today", "yes_no"),
+    ("have you seen this movie", "yes_no"),
+    ("is the store still open", "yes_no"),
+    ("was the meeting rescheduled", "yes_no"),
+    ("does this make sense to you", "yes_no"),
+    ("what is the capital of france", "what"),
+    ("what time is it right now", "what"),
+    ("what should i cook tonight", "what"),
+    ("what does this word actually mean", "what"),
+    ("what's the plan for tomorrow", "what"),
+    ("what happened at the meeting", "what"),
+    ("what is your favorite book", "what"),
+    ("why is the sky blue", "why"),
+    ("why did you do that", "why"),
+    ("why is the server down", "why"),
+    ("why can't i log into my account", "why"),
+    ("why does this keep happening", "why"),
+    ("why would anyone choose that option", "why"),
+    ("how do i reset my password", "how"),
+    ("how does this feature work", "how"),
+    ("how far is the airport from here", "how"),
+    ("how many people showed up", "how"),
+    ("how do you make this recipe", "how"),
+    ("how did you fix that bug", "how"),
+    ("who wrote this book", "who"),
+    ("who is the current president", "who"),
+    ("who called earlier today", "who"),
+    ("who's coming to the party tonight", "who"),
+    ("who's responsible for this decision", "who"),
+    ("when does the store open", "when"),
+    ("when is the project deadline", "when"),
+    ("when did this whole thing start", "when"),
+    ("when will you arrive at the office", "when"),
+    ("when is the next holiday", "when"),
+    ("where is the nearest train station", "where"),
+    ("where did i leave my keys", "where"),
+    ("where should we meet for lunch", "where"),
+    ("where is the nearest exit", "where"),
+    ("where do you live these days", "where"),
+    ("close the door on your way out", "other"),
+    ("that's absolutely amazing news", "other"),
+    ("i really love this song", "other"),
+    ("stop right there immediately", "other"),
+    ("please send over the file", "other"),
+    ("what a beautiful sunset tonight", "other"),
+]
+
+
+# --- TEXT_COMPLEXITY_EXAMPLES (support, from 32_deep_networks.py) ---
+TEXT_COMPLEXITY_EXAMPLES = [
+    ("i like cats", 0.03),
+    ("the sun is hot", 0.04),
+    ("we ate lunch", 0.03),
+    ("he ran fast", 0.03),
+    ("it is cold today", 0.05),
+    ("she likes tea", 0.04),
+    ("the dog barked loudly", 0.08),
+    ("we went to the park", 0.07),
+    ("i am very tired", 0.05),
+    ("the car is red", 0.04),
+    ("please close the door", 0.06),
+    ("this is a good book", 0.07),
+    ("my friend called me today", 0.09),
+    ("the store closes at six", 0.10),
+    ("we should leave soon", 0.08),
+    ("the committee reviewed the quarterly budget report before the meeting", 0.45),
+    ("she decided to pursue a career in mechanical engineering after graduation", 0.48),
+    ("the software update introduced several performance improvements and minor bug fixes", 0.50),
+    ("researchers observed a noticeable increase in rainfall across the region this year", 0.47),
+    ("the negotiations between the two companies concluded without a final agreement", 0.52),
+    ("investors remained cautious despite the unexpectedly positive earnings report", 0.55),
+    ("the museum's new exhibit explores the intersection of art and technology", 0.46),
+    ("local authorities announced updated guidelines for construction permits", 0.49),
+    ("the novel explores themes of identity and belonging through its protagonist", 0.53),
+    ("economists debated whether the policy change would affect long-term growth", 0.56),
+    ("the epistemological ramifications of quantum indeterminacy continue to provoke substantial disagreement among contemporary philosophers of science", 0.92),
+    ("notwithstanding the aforementioned stipulations, the plaintiff's counsel maintained that the contractual obligations remained enforceable despite the ostensible ambiguity therein", 0.95),
+    ("the juxtaposition of postmodern architectural elements against the neoclassical facade exemplifies a deliberate subversion of stylistic orthodoxy", 0.90),
+    ("the committee's deliberations were characterized by an ostensibly irreconcilable divergence of epistemic priors regarding fiscal sustainability", 0.93),
+    ("her dissertation interrogates the phenomenological underpinnings of intersubjective consciousness within a post-structuralist framework", 0.94),
+    ("the arbitration tribunal's jurisdiction was contested on the grounds of an alleged procedural irregularity in the antecedent proceedings", 0.91),
+    ("the algorithm's asymptotic complexity renders it computationally intractable for sufficiently large input cardinalities", 0.89),
+    ("the paper's central thesis hinges on a nuanced reinterpretation of hermeneutical tradition vis-a-vis contemporary critical theory", 0.93),
+]
+
+
+# --- EMOJI_EXAMPLES (support, from 32_deep_networks.py) ---
+EMOJI_EXAMPLES = [
+    ("i got the job, i'm thrilled", "happy"),
+    ("what a wonderful day this has been", "happy"),
+    ("feeling great today, everything's going well", "happy"),
+    ("i'm so pleased with how this turned out", "happy"),
+    ("this made me really happy", "happy"),
+    ("i miss my old friends so much", "sad"),
+    ("today was really rough, i feel down", "sad"),
+    ("i feel so low right now", "sad"),
+    ("this news made me quite sad", "sad"),
+    ("i've been feeling blue all week", "sad"),
+    ("i adore my family more than anything", "love"),
+    ("you mean the whole world to me", "love"),
+    ("sending you all my love today", "love"),
+    ("i love spending time with you", "love"),
+    ("my heart is so full of love right now", "love"),
+    ("that joke was absolutely hilarious", "laugh"),
+    ("i can't stop laughing at this", "laugh"),
+    ("lol that's so funny, i'm dying", "laugh"),
+    ("this is the funniest thing i've seen all week", "laugh"),
+    ("i burst out laughing at that", "laugh"),
+    ("this is absolutely infuriating", "angry"),
+    ("i'm so mad about this right now", "angry"),
+    ("that really ticked me off", "angry"),
+    ("i'm furious about how this was handled", "angry"),
+    ("this makes my blood boil", "angry"),
+    ("wow, i did not see that coming at all", "surprised"),
+    ("no way, seriously? that's shocking", "surprised"),
+    ("that's such surprising news", "surprised"),
+    ("i'm stunned, i didn't expect that", "surprised"),
+    ("whoa, that caught me completely off guard", "surprised"),
+    ("the meeting starts at noon today", "neutral"),
+    ("here is the document you requested", "neutral"),
+    ("please review the attached file", "neutral"),
+    ("the report is due next friday", "neutral"),
+    ("the office is on the third floor", "neutral"),
+]
+
+
+# --- GENERATOR_IMAGE_SIZE (support, from 16_vision.py) ---
+GENERATOR_IMAGE_SIZE = 256  # up from an earlier, smaller version of this generator
+
+
+# --- _NAME_SEED_CORPUS (support, from 27_name_generator.py) ---
+_NAME_SEED_CORPUS = [
+    "Thalindor", "Brenwyn", "Kaelith", "Isolde", "Vorathis", "Elendra",
+    "Driscoll", "Wynethra", "Orindel", "Faelwyn", "Gwyndor", "Morwenna",
+    "Silvarien", "Torvald", "Nyxandra", "Aerendil", "Bralthor", "Cynwise",
+    "Thalorien", "Brenmar", "Kaelwyn", "Isolwen", "Vorendil", "Elenmoor",
+    "Drisandra", "Wynmar", "Oristhas", "Faelmere", "Gwynshade", "Morwyn",
+]
+
+
+# --- _ADJECTIVES (support, from 27_name_generator.py) ---
+_ADJECTIVES = [
+    "swift", "quiet", "brave", "clever", "bright", "hidden", "bold",
+    "calm", "wild", "gentle", "sharp", "lucky", "steady", "curious",
+]
+
+
+# --- _NOUNS (support, from 27_name_generator.py) ---
+_NOUNS = [
+    "otter", "falcon", "ember", "willow", "comet", "harbor", "maple",
+    "raven", "pebble", "lantern", "sparrow", "thistle", "cinder",
+]
+
+
+# --- _PROJECT_NOUNS (support, from 27_name_generator.py) ---
+_PROJECT_NOUNS = [
+    "Compass", "Anchor", "Beacon", "Bridge", "Horizon", "Ledger",
+    "Signal", "Atlas", "Forge", "Nexus", "Trellis", "Cascade",
+]
+
+
+# --- _CharMarkovChain (support, from 27_name_generator.py) ---
+class _CharMarkovChain:
+    def __init__(self, corpus, order=_ORDER):
+        self.order = order
+        self.transitions = defaultdict(Counter)
+        for word in corpus:
+            padded = ("\0" * order) + word + _END
+            for i in range(len(padded) - order):
+                state = padded[i:i + order]
+                nxt = padded[i + order]
+                self.transitions[state][nxt] += 1
+
+    def generate(self, max_len=12, min_len=4):
+        for _attempt in range(20):  # a few tries in case we hit min_len too early
+            state = "\0" * self.order
+            chars = []
+            for _ in range(max_len):
+                counts = self.transitions.get(state)
+                if not counts:
+                    break
+                population = list(counts.elements())
+                nxt = random.choice(population)
+                if nxt == _END:
+                    if len(chars) >= min_len:
+                        break
+                    else:
+                        continue  # too short, keep going instead of ending
+                chars.append(nxt)
+                state = (state + nxt)[-self.order:]
+            if len(chars) >= min_len:
+                return "".join(chars)
+        return "".join(chars) if chars else random.choice(_NAME_SEED_CORPUS)
+
+
+# --- _MORSE_TABLE (support, from 25_cipher_tools.py) ---
+_MORSE_TABLE = {
+    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".", "F": "..-.",
+    "G": "--.", "H": "....", "I": "..", "J": ".---", "K": "-.-", "L": ".-..",
+    "M": "--", "N": "-.", "O": "---", "P": ".--.", "Q": "--.-", "R": ".-.",
+    "S": "...", "T": "-", "U": "..-", "V": "...-", "W": ".--", "X": "-..-",
+    "Y": "-.--", "Z": "--..",
+    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
+    "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.",
+}
+
+
+# --- _MORSE_REVERSE (support, from 25_cipher_tools.py) ---
+_MORSE_REVERSE = {v: k for k, v in _MORSE_TABLE.items()}
+
+
+# --- _ALPHABET (support, from 25_cipher_tools.py) ---
+_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+# --- _FONT (support, from 28_ascii_art.py) ---
+_FONT = {
+    "A": [" ## ", "#  #", "####", "#  #", "#  #"],
+    "B": ["### ", "#  #", "### ", "#  #", "### "],
+    "C": [" ###", "#   ", "#   ", "#   ", " ###"],
+    "D": ["### ", "#  #", "#  #", "#  #", "### "],
+    "E": ["####", "#   ", "### ", "#   ", "####"],
+    "F": ["####", "#   ", "### ", "#   ", "#   "],
+    "G": [" ###", "#   ", "# ##", "#  #", " ###"],
+    "H": ["#  #", "#  #", "####", "#  #", "#  #"],
+    "I": ["###", " # ", " # ", " # ", "###"],
+    "J": ["  ##", "   #", "   #", "#  #", " ## "],
+    "K": ["#  #", "# # ", "##  ", "# # ", "#  #"],
+    "L": ["#   ", "#   ", "#   ", "#   ", "####"],
+    "M": ["#  #", "####", "####", "#  #", "#  #"],
+    "N": ["#  #", "## #", "# ##", "#  #", "#  #"],
+    "O": [" ## ", "#  #", "#  #", "#  #", " ## "],
+    "P": ["### ", "#  #", "### ", "#   ", "#   "],
+    "Q": [" ## ", "#  #", "#  #", "# # ", " ###"],
+    "R": ["### ", "#  #", "### ", "# # ", "#  #"],
+    "S": [" ###", "#   ", " ## ", "   #", "### "],
+    "T": ["###", " # ", " # ", " # ", " # "],
+    "U": ["#  #", "#  #", "#  #", "#  #", " ## "],
+    "V": ["#  #", "#  #", "#  #", " ## ", " ## "],
+    "W": ["#  #", "#  #", "####", "####", "#  #"],
+    "X": ["#  #", " ## ", " ## ", " ## ", "#  #"],
+    "Y": ["#  #", " ## ", " #  ", " #  ", " #  "],
+    "Z": ["####", "  # ", " #  ", "#   ", "####"],
+    " ": ["  ", "  ", "  ", "  ", "  "],
+    "0": [" ## ", "#  #", "#  #", "#  #", " ## "],
+    "1": [" # ", "## ", " # ", " # ", "###"],
+    "2": ["### ", "   #", " ## ", "#   ", "####"],
+    "3": ["### ", "   #", " ## ", "   #", "### "],
+    "4": ["#  #", "#  #", "####", "   #", "   #"],
+    "5": ["####", "#   ", "### ", "   #", "### "],
+    "6": [" ###", "#   ", "### ", "#  #", " ## "],
+    "7": ["####", "   #", "  # ", " #  ", " #  "],
+    "8": [" ## ", "#  #", " ## ", "#  #", " ## "],
+    "9": [" ## ", "#  #", " ###", "   #", "### "],
+    "!": ["#", "#", "#", " ", "#"],
+    "?": [" ##", "  #", " # ", "   ", " # "],
+}
+
+
+# --- _SHAPES (support, from 28_ascii_art.py) ---
+_SHAPES = {
+    "triangle": lambda n: "\n".join(("*" * (2 * i + 1)).center(2 * n - 1) for i in range(1, n + 1)),
+    "square": lambda n: "\n".join("*" * n for _ in range(n)),
+    "diamond": lambda n: "\n".join(("*" * (2 * i + 1)).center(2 * n - 1) for i in range(1, n + 1))
+    + "\n" + "\n".join(("*" * (2 * i + 1)).center(2 * n - 1) for i in range(n - 1, 0, -1)),
+    "star": lambda n: _draw_star(n),
+    "heart": lambda n: _draw_heart(n),
+}
+
+
+# --- _MOOD_LABELS (support, from 10_neural_networks.py) ---
+_MOOD_LABELS = ["positive", "neutral", "negative"]
+
+
+# --- _MOOD_TO_ID (support, from 10_neural_networks.py) ---
+_MOOD_TO_ID = {label: i for i, label in enumerate(_MOOD_LABELS)}
+
+
+# --- _build_mood_sequence_dataset (support, from 10_neural_networks.py) ---
+def _build_mood_sequence_dataset(num_sequences: int = 600, seq_len: int = 5, seed: int = 42):
+    """
+    Builds (X, y) where each row of X is a sequence of seq_len mood-id
+    integers and the matching y is the id of the mood that FOLLOWED
+    that sequence in the sampled chain - i.e. "given these last 5 moods,
+    what came next" - genuinely a next-step sequence prediction dataset,
+    not a relabeled classification dataset.
+    """
+    rng = random.Random(seed)
+    X, y = [], []
+    for _ in range(num_sequences):
+        full_sequence = _sample_mood_sequence(rng, seq_len + 1)
+        window = full_sequence[:seq_len]
+        target = full_sequence[seq_len]
+        X.append([_MOOD_TO_ID[m] for m in window])
+        y.append(_MOOD_TO_ID[target])
+    return np.array(X, dtype=np.int64), np.array(y, dtype=np.int64)
+
+
+
+
+# --- _TextVocab (support2, from 10_neural_networks.py) ---
+class _TextVocab:
+    """
+    A small hand-built vocabulary shared by both neural networks' torch
+    backend: maps whitespace-tokenized lowercase words to integer ids,
+    with <pad> (id 0) and <unk> (id 1) reserved tokens. This replaces
+    TF-IDF for the torch path - instead of sparse one-hot-ish counts,
+    each word gets a dense, LEARNED embedding vector (see nn.Embedding
+    in the model classes below), trained jointly with the classifier so
+    semantically related words can end up with similar vectors even if
+    they never appeared together in training.
+    """
+
+    PAD, UNK = "<pad>", "<unk>"
+
+    def __init__(self, texts, max_len=14):
+        self.max_len = max_len
+        vocab = set()
+        for t in texts:
+            vocab.update(self._tokenize(t))
+        self.itos = [self.PAD, self.UNK] + sorted(vocab)
+        self.stoi = {w: i for i, w in enumerate(self.itos)}
+
+    @staticmethod
+    def _tokenize(text):
+        return text.lower().replace("'", " ").replace(",", " ").replace(":", " ").split()
+
+    def encode(self, text):
+        tokens = self._tokenize(text)[: self.max_len]
+        ids = [self.stoi.get(tok, self.stoi[self.UNK]) for tok in tokens]
+        ids += [self.stoi[self.PAD]] * (self.max_len - len(ids))
+        return ids
+
+    def __len__(self):
+        return len(self.itos)
+
+
+# --- _sample_mood_sequence (support2, from 10_neural_networks.py) ---
+def _sample_mood_sequence(rng: random.Random, length: int) -> list:
+    """Samples one plausible mood sequence of the given length from the
+    weighted Markov chain above, starting from a uniformly random mood."""
+    sequence = [rng.choice(_MOOD_LABELS)]
+    for _ in range(length - 1):
+        current = sequence[-1]
+        weights = _MOOD_TRANSITION_WEIGHTS[current]
+        labels, weight_values = zip(*weights.items())
+        next_mood = rng.choices(labels, weights=weight_values, k=1)[0]
+        sequence.append(next_mood)
+    return sequence
+
+
+# --- _draw_star (support2, from 28_ascii_art.py) ---
+def _draw_star(n):
+    """A six-pointed star (hexagram) drawn as two overlapping
+    triangles, one upright and one inverted, offset so their points
+    interleave - the classic "Star of David" construction. Computed
+    from the same triangle-row math as the plain triangle shape
+    rather than a fixed lookup table, so it scales to any size."""
+    size = max(3, n)
+    width = 4 * size - 1
+    grid = [[" "] * width for _ in range(2 * size)]
+
+    # upright triangle, apex at top-center
+    for row in range(size):
+        half = row
+        center = width // 2
+        for col in range(center - half, center + half + 1):
+            grid[row][col] = "*"
+
+    # inverted triangle, apex at bottom-center, drawn size-1 rows down
+    offset = size - 1
+    for row in range(size):
+        half = size - 1 - row
+        center = width // 2
+        r = row + offset
+        if r < len(grid):
+            for col in range(center - half, center + half + 1):
+                grid[r][col] = "*"
+
+    return "\n".join("".join(row).rstrip() for row in grid if "".join(row).strip())
+
+
+# --- _draw_heart (support2, from 28_ascii_art.py) ---
+def _draw_heart(n):
+    """Renders the classic implicit heart curve
+    (x^2+y^2-1)^3 - x^2*y^3 <= 0 onto a text grid - genuinely computed
+    from the curve at whatever resolution `n` implies, not a fixed
+    template."""
+    width = max(16, n * 3)
+    height = width // 2
+    lines = []
+    for row_i in range(height):
+        row = []
+        for col_i in range(width):
+            x = (col_i - width / 2) / (width / 2) * 1.5
+            y = (height / 2 - row_i) / (height / 2) * 1.5 - 0.4
+            val = (x ** 2 + y ** 2 - 1) ** 3 - (x ** 2) * (y ** 3)
+            row.append("*" if val <= 0 else " ")
+        line = "".join(row).rstrip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+# --- ScientificCalculator (from 06_text_number_tools.py) ---
+class ScientificCalculator:
+    """Single-function scientific calculator: one recognized pattern
+    per operation, computed with Python's math module (no eval, no
+    expression parser) - the same "rigid, no arbitrary code execution"
+    philosophy as _handle_simple_math."""
+
+    @staticmethod
+    def sqrt(value: float):
+        if value < 0:
+            return None  # no complex-number support - fail closed rather than raise
+        return math.sqrt(value)
+
+    @staticmethod
+    def power(base: float, exponent: float):
+        try:
+            return base ** exponent
+        except (OverflowError, ValueError):
+            return None
+
+    @staticmethod
+    def log(value: float, base: float = 10.0):
+        if value <= 0:
+            return None
+        try:
+            return math.log(value, base)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def ln(value: float):
+        if value <= 0:
+            return None
+        return math.log(value)
+
+    @staticmethod
+    def sin_degrees(value: float):
+        return math.sin(math.radians(value))
+
+    @staticmethod
+    def cos_degrees(value: float):
+        return math.cos(math.radians(value))
+
+    @staticmethod
+    def tan_degrees(value: float):
+        return math.tan(math.radians(value))
+
+    @staticmethod
+    def factorial(n: int):
+        if n < 0 or n != int(n):
+            return None
+        if n > 170:  # float overflow territory for math.factorial's result
+            return None
+        return math.factorial(int(n))
+
+    @staticmethod
+    def percentage_of(percent: float, whole: float):
+        return (percent / 100.0) * whole
+
+    @staticmethod
+    def percent_change(old_value: float, new_value: float):
+        if old_value == 0:
+            return None
+        return ((new_value - old_value) / old_value) * 100.0
+
+
+# --- TextCaseConverter (from 06_text_number_tools.py) ---
+class TextCaseConverter:
+    @staticmethod
+    def _split_words(text: str) -> list:
+        """Normalizes snake_case, kebab-case, camelCase, PascalCase,
+        and plain space-separated text into a list of lowercase words."""
+        # Insert a space before each internal uppercase letter (handles
+        # camelCase/PascalCase), then split on any non-alphanumeric run.
+        spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+        words = re.split(r"[\s_\-]+", spaced)
+        return [w.lower() for w in words if w]
+
+    @classmethod
+    def to_snake_case(cls, text: str) -> str:
+        return "_".join(cls._split_words(text))
+
+    @classmethod
+    def to_kebab_case(cls, text: str) -> str:
+        return "-".join(cls._split_words(text))
+
+    @classmethod
+    def to_camel_case(cls, text: str) -> str:
+        words = cls._split_words(text)
+        if not words:
+            return ""
+        return words[0] + "".join(w.capitalize() for w in words[1:])
+
+    @classmethod
+    def to_pascal_case(cls, text: str) -> str:
+        words = cls._split_words(text)
+        return "".join(w.capitalize() for w in words)
+
+    @classmethod
+    def to_title_case(cls, text: str) -> str:
+        words = cls._split_words(text)
+        return " ".join(w.capitalize() for w in words)
+
+    @staticmethod
+    def to_upper_case(text: str) -> str:
+        return text.upper()
+
+    @staticmethod
+    def to_lower_case(text: str) -> str:
+        return text.lower()
+
+    @classmethod
+    def convert(cls, text: str, target_case: str):
+        target_case = target_case.lower().strip()
+        converters = {
+            "snake": cls.to_snake_case, "snake_case": cls.to_snake_case,
+            "kebab": cls.to_kebab_case, "kebab-case": cls.to_kebab_case,
+            "camel": cls.to_camel_case, "camelcase": cls.to_camel_case,
+            "pascal": cls.to_pascal_case, "pascalcase": cls.to_pascal_case,
+            "title": cls.to_title_case, "titlecase": cls.to_title_case,
+            "upper": cls.to_upper_case, "uppercase": cls.to_upper_case,
+            "lower": cls.to_lower_case, "lowercase": cls.to_lower_case,
+        }
+        fn = converters.get(target_case)
+        if fn is None:
+            return None
+        return fn(text)
+
+
+# --- PasswordGenerator (from 06_text_number_tools.py) ---
+class PasswordGenerator:
+    AMBIGUOUS_CHARS = set("Il1O0")
+
+    @staticmethod
+    def generate(length: int = 16, use_upper: bool = True, use_digits: bool = True,
+                 use_symbols: bool = True, avoid_ambiguous: bool = True) -> str:
+        length = max(4, min(length, 128))
+        pool = list(string.ascii_lowercase)
+        if use_upper:
+            pool += list(string.ascii_uppercase)
+        if use_digits:
+            pool += list(string.digits)
+        if use_symbols:
+            pool += list("!@#$%^&*()-_=+[]{}")
+        if avoid_ambiguous:
+            pool = [c for c in pool if c not in PasswordGenerator.AMBIGUOUS_CHARS]
+        return "".join(secrets.choice(pool) for _ in range(length))
+
+    @staticmethod
+    def generate_passphrase(num_words: int = 4, separator: str = "-") -> str:
+        """
+        A Diceware-style passphrase (several random dictionary words
+        joined together) - generally easier for a human to actually
+        remember than an equal-entropy string of random symbols, which
+        is why NIST and most modern password guidance now recommends
+        passphrases as an alternative to complex short passwords. Word
+        list is FunExtras.QUOTES/RIDDLES/JOKES vocabulary rather than a
+        dedicated wordlist (this file doesn't bundle one), so entropy
+        here is illustrative, not a rigorous Diceware-equivalent count.
+        """
+        num_words = max(2, min(num_words, 10))
+        word_pool = sorted(_NGRAM_UNIGRAMS.keys()) if "_NGRAM_UNIGRAMS" in globals() else []
+        word_pool = [w for w in word_pool if w.isalpha() and 3 <= len(w) <= 9]
+        if len(word_pool) < num_words:
+            # Fallback word list if the n-gram vocabulary isn't available
+            # for some reason - keeps this generator working standalone.
+            word_pool = ["orbit", "maple", "cobalt", "ember", "quartz", "willow",
+                         "harbor", "signal", "canyon", "lantern", "meadow", "ripple"]
+        chosen = [secrets.choice(word_pool) for _ in range(num_words)]
+        return separator.join(w.capitalize() for w in chosen)
+
+    @staticmethod
+    def estimate_entropy_bits(length: int, pool_size: int) -> float:
+        """log2(pool_size^length) - a standard entropy estimate for a
+        uniformly random string, used to give a rough strength read."""
+        if pool_size <= 1 or length <= 0:
+            return 0.0
+        return length * math.log2(pool_size)
+
+
+# --- HashCalculator (from 06_text_number_tools.py) ---
+class HashCalculator:
+    ALGORITHMS = ("md5", "sha1", "sha256", "sha512")
+
+    @classmethod
+    def hash_text(cls, text: str, algorithm: str = "sha256"):
+        algorithm = algorithm.lower().strip()
+        if algorithm not in cls.ALGORITHMS:
+            return None
+        hasher = hashlib.new(algorithm)
+        hasher.update(text.encode("utf-8"))
+        return hasher.hexdigest()
+
+    @classmethod
+    def hash_all(cls, text: str) -> dict:
+        return {algo: cls.hash_text(text, algo) for algo in cls.ALGORITHMS}
+
+    @classmethod
+    def format_hash(cls, text: str, algorithm: str = "sha256") -> str:
+        digest = cls.hash_text(text, algorithm)
+        if digest is None:
+            return f"I don't know the '{algorithm}' algorithm - try: {', '.join(cls.ALGORITHMS)}."
+        return f"{algorithm}: {digest}"
+
+
+# --- Base64Tool (from 06_text_number_tools.py) ---
+class Base64Tool:
+    @staticmethod
+    def encode(text: str) -> str:
+        return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+    @staticmethod
+    def decode(encoded: str):
+        """Returns the decoded string, or None if the input isn't
+        valid base64 (fails closed rather than raising)."""
+        try:
+            return base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            return None
+
+    @classmethod
+    def format_encode(cls, text: str) -> str:
+        return cls.encode(text)
+
+    @classmethod
+    def format_decode(cls, encoded: str) -> str:
+        result = cls.decode(encoded)
+        if result is None:
+            return "That doesn't look like valid base64 text."
+        return result
+
+
+# --- DataFormatTool (from 06_text_number_tools.py) ---
+class DataFormatTool:
+    @staticmethod
+    def validate_json(text: str) -> dict:
+        try:
+            parsed = json.loads(text)
+            return {"valid": True, "parsed": parsed}
+        except json.JSONDecodeError as e:
+            return {"valid": False, "error": str(e), "line": e.lineno, "column": e.colno}
+
+    @classmethod
+    def format_json_check(cls, text: str) -> str:
+        result = cls.validate_json(text)
+        if not result["valid"]:
+            return f"Invalid JSON: {result['error']} (line {result['line']}, column {result['column']})."
+        pretty = json.dumps(result["parsed"], indent=2, ensure_ascii=False)
+        kind = type(result["parsed"]).__name__
+        return f"Valid JSON ({kind}). Pretty-printed:\n{pretty}"
+
+    @staticmethod
+    def validate_csv(text: str) -> dict:
+        try:
+            reader = csv.reader(io.StringIO(text))
+            rows = list(reader)
+        except csv.Error as e:
+            return {"valid": False, "error": str(e)}
+        if not rows:
+            return {"valid": False, "error": "No rows found."}
+        column_counts = {len(row) for row in rows}
+        consistent = len(column_counts) == 1
+        return {
+            "valid": True,
+            "row_count": len(rows),
+            "column_count": len(rows[0]),
+            "consistent_columns": consistent,
+            "header": rows[0] if rows else [],
+        }
+
+    @classmethod
+    def format_csv_check(cls, text: str) -> str:
+        result = cls.validate_csv(text)
+        if not result["valid"]:
+            return f"Invalid CSV: {result['error']}"
+        consistency_note = (
+            "all rows have a consistent column count" if result["consistent_columns"]
+            else "WARNING: rows have inconsistent column counts (possible malformed row)"
+        )
+        return (f"CSV looks parseable: {result['row_count']} row(s), "
+                f"{result['column_count']} column(s) in the header, {consistency_note}. "
+                f"Header: {', '.join(result['header'])}")
+
+
+# --- SimpleEntityExtractor (from 06_text_number_tools.py) ---
+class SimpleEntityExtractor:
+    EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+    URL_RE = re.compile(r"\bhttps?://[^\s]+\b")
+    MONEY_RE = re.compile(r"\$\d+(?:,\d{3})*(?:\.\d{2})?\b|\b\d+(?:,\d{3})*(?:\.\d{2})?\s?(?:usd|dollars|kes|eur|euros)\b", re.IGNORECASE)
+    TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\s?(?:am|pm)?\b", re.IGNORECASE)
+    PHONE_RE = re.compile(r"\b(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b")
+    HASHTAG_RE = re.compile(r"#\w+")
+    MENTION_RE = re.compile(r"(?<!\w)@\w+")
+
+    @classmethod
+    def extract_proper_nouns(cls, text: str) -> list:
+        """Capitalized words NOT at the start of a sentence, and multi-
+        word capitalized runs anywhere - a common, if imprecise,
+        heuristic for proper nouns. Filters out the most common
+        sentence-starting false positives it can (a word immediately
+        following '.', '!', '?', or the very start of the text)."""
+        candidates = []
+        # multi-word capitalized runs first (e.g. "New York", "Ada Lovelace")
+        for match in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text):
+            candidates.append(match.group(1))
+        # single capitalized words not at a sentence boundary
+        sentence_start_positions = {0}
+        for m in re.finditer(r"[.!?]\s+", text):
+            sentence_start_positions.add(m.end())
+        for match in re.finditer(r"\b[A-Z][a-z]+\b", text):
+            if match.start() not in sentence_start_positions:
+                word = match.group(0)
+                if not any(word in c for c in candidates):
+                    candidates.append(word)
+        return candidates
+
+    @classmethod
+    def extract(cls, text: str, date_engine: "DateTimeEngine" = None) -> dict:
+        entities = {
+            "emails": cls.EMAIL_RE.findall(text),
+            "urls": cls.URL_RE.findall(text),
+            "money": cls.MONEY_RE.findall(text),
+            "times": cls.TIME_RE.findall(text),
+            "phone_numbers": cls.PHONE_RE.findall(text),
+            "hashtags": cls.HASHTAG_RE.findall(text),
+            "mentions": cls.MENTION_RE.findall(text),
+            "proper_nouns": cls.extract_proper_nouns(text),
+        }
+        return {k: v for k, v in entities.items() if v}
+
+    @classmethod
+    def format_extraction(cls, text: str) -> str:
+        entities = cls.extract(text)
+        if not entities:
+            return "I didn't find any recognizable entities (emails, URLs, dates, money, proper nouns, etc.) in that text."
+        lines = ["Entities found:"]
+        for label, values in entities.items():
+            unique_values = list(dict.fromkeys(values))  # de-dupe, keep order
+            lines.append(f"  {label}: {', '.join(unique_values)}")
+        return "\n".join(lines)
+
+
+# --- TopicContinuityTracker (from 07_continuity_and_tone.py) ---
+class TopicContinuityTracker:
+    def __init__(self, max_history: int = 20):
+        self.max_history = max_history
+        self._history = []  # list of (topic_label, timestamp)
+
+    def record(self, topic_label: str):
+        if not topic_label:
+            return
+        # Collapse immediate repeats (asking two jokes in a row
+        # shouldn't count as "changing topic and changing back").
+        if self._history and self._history[-1][0] == topic_label:
+            return
+        self._history.append((topic_label, dt.datetime.now()))
+        if len(self._history) > self.max_history:
+            self._history.pop(0)
+
+    def previous_topic(self):
+        """Returns the topic label BEFORE the current one, or None if
+        there isn't one yet."""
+        if len(self._history) < 2:
+            return None
+        return self._history[-2][0]
+
+    def current_topic(self):
+        if not self._history:
+            return None
+        return self._history[-1][0]
+
+    def recent_topics(self, limit: int = 5) -> list:
+        return [label for label, _ts in self._history[-limit:]]
+
+    def format_recent_topics(self, limit: int = 5) -> str:
+        topics = self.recent_topics(limit)
+        if not topics:
+            return "We haven't really settled on any particular topics yet this session."
+        readable = [t.replace("_", " ") for t in topics]
+        return "We've touched on: " + ", ".join(readable) + "."
+
+
+# --- AdaptiveToneTracker (from 07_continuity_and_tone.py) ---
+class AdaptiveToneTracker:
+    CASUAL_MARKERS = {
+        "lol", "lmao", "haha", "hehe", "yo", "hey", "hii", "heyy", "ayy",
+        "gonna", "wanna", "kinda", "sorta", "yeah", "yep", "nah", "sup",
+        "niaje", "sasa", "poa", "buda", "msee", "fiti", "omg", "btw",
+    }
+    FORMAL_MARKERS = {
+        "furthermore", "therefore", "however", "regarding", "shall",
+        "would", "could", "please", "kindly", "greetings", "sincerely",
+        "appreciate", "assist", "inquire", "request", "accordingly",
+    }
+    _CONTRACTION_RE = re.compile(r"\b\w+'(t|re|ve|ll|d|s|m)\b")
+    _REPEATED_LETTERS_RE = re.compile(r"(.)\1{2,}")
+
+    def __init__(self, smoothing: float = 0.25):
+        self.smoothing = smoothing
+        self.score = 0.5  # 0.0 = very casual, 1.0 = very formal; start neutral
+
+    def score_message(self, text: str) -> float:
+        if not text:
+            return self.score
+        lower = text.lower()
+        words = re.findall(r"[a-z']+", lower)
+        if not words:
+            return self.score
+
+        casual_hits = sum(1 for w in words if w in self.CASUAL_MARKERS)
+        formal_hits = sum(1 for w in words if w in self.FORMAL_MARKERS)
+        has_contraction = bool(self._CONTRACTION_RE.search(lower))
+        has_repeated_letters = bool(self._REPEATED_LETTERS_RE.search(lower))
+        starts_lowercase = text[:1].islower()
+        avg_word_len = sum(len(w) for w in words) / len(words)
+        ends_properly_punctuated = text.rstrip().endswith((".", ":", ";"))
+
+        casual_signal = casual_hits * 2 + has_contraction + has_repeated_letters + starts_lowercase
+        formal_signal = formal_hits * 2 + (avg_word_len > 5.5) + (text[:1].isupper() and ends_properly_punctuated)
+
+        raw = (formal_signal / (casual_signal + formal_signal)) if (casual_signal or formal_signal) else 0.5
+        self.score = self.score * (1 - self.smoothing) + raw * self.smoothing
+        return self.score
+
+    def is_casual(self) -> bool:
+        return self.score < 0.4
+
+    def is_formal(self) -> bool:
+        return self.score > 0.6
+
+    def describe(self) -> str:
+        if self.is_casual():
+            return "casual"
+        if self.is_formal():
+            return "formal"
+        return "neutral"
+
+    def format_status(self) -> str:
+        return f"Detected conversational register: {self.describe()} (score {self.score:.2f}, 0=casual, 1=formal)."
+
+
+# --- MoodTrendForecaster (from 10_neural_networks.py) ---
+class MoodTrendForecaster:
+    """
+    Given the last few detected sentiment readings in a conversation
+    (see SentimentClassifier, Section 6G), forecasts which mood is most
+    likely next. Backed by an LSTM when TensorFlow is available (see the
+    Section 6H2 module docstring above for why an LSTM specifically),
+    with a simple recency-weighted frequency heuristic as an offline
+    fallback.
+
+    This powers an optional, low-key check-in nudge: if the forecaster
+    is confident the conversation is trending negative, ChatBot can
+    choose to soften its tone or surface supportive resources rather
+    than plowing ahead - see ChatBot._maybe_check_in() for where this
+    forecast actually gets used.
+    """
+
+    SEQUENCE_LENGTH = 5
+
+    def __init__(self):
+        self.backend = "tensorflow" if TENSORFLOW_AVAILABLE else "recency_weighted"
+        self.model = None
+        self.last_training_info = None
+        self._fit()
+
+    def _fit(self):
+        X, y = _build_mood_sequence_dataset(seq_len=self.SEQUENCE_LENGTH)
+        if self.backend == "tensorflow":
+            self._fit_keras(X, y)
+        else:
+            self.last_training_info = {"note": "TensorFlow not installed - using recency-weighted heuristic"}
+
+    def _fit_keras(self, X, y):
+        tf.random.set_seed(42)
+        num_classes = len(_MOOD_LABELS)
+
+        # Widened from 2 to 3 LSTM layers plus 3 Dense layers (up from
+        # 1), alongside the broader push for depth across every network
+        # in this file.
+        model = keras.Sequential([
+            keras.layers.Input(shape=(self.SEQUENCE_LENGTH,)),
+            keras.layers.Embedding(input_dim=num_classes, output_dim=8, name="mood_embedding"),
+            keras.layers.LSTM(32, return_sequences=True, name="lstm_1"),
+            keras.layers.Dropout(0.2),
+            keras.layers.LSTM(24, return_sequences=True, name="lstm_2"),
+            keras.layers.Dropout(0.2),
+            keras.layers.LSTM(16, name="lstm_3"),
+            keras.layers.Dense(32, activation="relu"),
+            keras.layers.Dropout(0.15),
+            keras.layers.Dense(24, activation="relu"),
+            keras.layers.Dropout(0.15),
+            keras.layers.Dense(16, activation="relu"),
+            keras.layers.Dropout(0.1),
+            keras.layers.Dense(num_classes, activation="softmax", name="next_mood"),
+        ])
+        model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+
+        callbacks = [
+            keras.callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True),
+        ]
+        history = model.fit(
+            X, y, epochs=60, batch_size=32, verbose=0, validation_split=0.15, callbacks=callbacks
+        )
+        self.model = model
+        self.last_training_info = {
+            "final_loss": float(history.history["loss"][-1]),
+            "final_val_accuracy": float(history.history.get("val_accuracy", [0.0])[-1]),
+            "epochs_trained": len(history.history["loss"]),
+        }
+
+    def forecast(self, recent_moods: list):
+        """
+        recent_moods: a list of sentiment label strings ("positive",
+        "neutral", "negative"), most-recent LAST. Returns (predicted_
+        label, confidence) or None if fewer than 2 moods were given
+        (too little signal to forecast from).
+        """
+        cleaned = [m for m in recent_moods if m in _MOOD_TO_ID]
+        if len(cleaned) < 2:
+            return None
+
+        if self.backend == "tensorflow":
+            # Pad on the LEFT with the earliest known mood if the caller
+            # gave us fewer than SEQUENCE_LENGTH readings, so a short
+            # conversation still gets a forecast rather than being
+            # rejected outright.
+            padded = cleaned[:]
+            while len(padded) < self.SEQUENCE_LENGTH:
+                padded.insert(0, padded[0])
+            window = padded[-self.SEQUENCE_LENGTH:]
+            ids = np.array([[_MOOD_TO_ID[m] for m in window]])
+            probs = self.model.predict(ids, verbose=0)[0]
+            best_idx = int(np.argmax(probs))
+            return _MOOD_LABELS[best_idx], float(probs[best_idx])
+
+        return self._forecast_heuristic(cleaned)
+
+    @staticmethod
+    def _forecast_heuristic(cleaned: list):
+        """Recency-weighted frequency fallback: more recent moods count
+        more (linearly increasing weight by position), then normalize
+        into a pseudo-confidence. Deterministic, no model needed."""
+        weights = Counter()
+        for i, mood in enumerate(cleaned):
+            weights[mood] += (i + 1)  # later entries get more weight
+        total = sum(weights.values())
+        best_label, best_weight = weights.most_common(1)[0]
+        return best_label, best_weight / total
+
+    def format_forecast(self, recent_moods: list) -> str:
+        result = self.forecast(recent_moods)
+        if result is None:
+            return "I don't have enough recent mood signal yet to forecast a trend."
+        label, confidence = result
+        backend_note = "an LSTM sequence model" if self.backend == "tensorflow" else "a recency-weighted heuristic"
+        return f"Based on the last few messages, the mood trend looks {label} ({confidence:.0%} confidence, via {backend_note})."
+
+
+# --- PIIScrubber (from 11_llm_hybrid.py) ---
+class PIIScrubber:
+    PATTERNS = {
+        "email address": re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
+        "phone number": re.compile(r"\b(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b"),
+        "credit-card-shaped number": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
+        "US-SSN-shaped number": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    }
+
+    @classmethod
+    def scan(cls, text: str) -> list:
+        """Returns a list of the PII CATEGORY NAMES that matched (not
+        the matched text itself, to avoid this scanner's own output
+        becoming a place sensitive text gets echoed back)."""
+        found = []
+        for label, pattern in cls.PATTERNS.items():
+            if pattern.search(text):
+                found.append(label)
+        return found
+
+    @classmethod
+    def warning_for(cls, text: str):
+        """Returns a short warning string if `text` looks like it
+        contains PII, or None if it looks clean."""
+        found = cls.scan(text)
+        if not found:
+            return None
+        joined = ", ".join(found)
+        return (f"Heads up: this looks like it might contain a {joined}. "
+                f"That's about to be sent to an external AI service - "
+                f"want to remove it first?")
+
+
+# --- ConversationContextWindow (from 11_llm_hybrid.py) ---
+class ConversationContextWindow:
+    def __init__(self, max_tokens: int = 800):
+        self.max_tokens = max_tokens
+        self.turns = []  # list of (speaker, text)
+
+    def add_turn(self, speaker: str, text: str):
+        self.turns.append((speaker, text))
+
+    def clear(self):
+        self.turns = []
+
+    def build_context_block(self) -> str:
+        """Returns the most recent turns, newest last, formatted as
+        'speaker: text' lines, trimmed from the OLDEST end until the
+        whole block fits within max_tokens (estimated)."""
+        kept = list(self.turns)
+        while kept:
+            block = "\n".join(f"{speaker}: {text}" for speaker, text in kept)
+            if LLMConnector.estimate_tokens(block) <= self.max_tokens:
+                return block
+            kept.pop(0)  # drop the oldest turn and try again
+        return ""
+
+    def build_prompt_with_context(self, new_user_text: str) -> str:
+        context_block = self.build_context_block()
+        if not context_block:
+            return new_user_text
+        return (f"Recent conversation so far:\n{context_block}\n\n"
+                f"Now respond to this new message:\n{new_user_text}")
+
+
+# --- ExtractiveSummarizer (from 11_llm_hybrid.py) ---
+class ExtractiveSummarizer:
+    """
+    Offline, non-LLM fallback for conversation/text summarization: ranks
+    sentences by TF-IDF-weighted word overlap with the rest of the
+    document (a classic, well-established extractive-summarization
+    technique - essentially a tiny single-document version of the idea
+    behind TextRank) and returns the top-N highest-scoring sentences, in
+    their ORIGINAL order, so the summary still reads coherently rather
+    than as a shuffled bag of high-scoring fragments.
+
+    Used automatically by ChatBot whenever LLMConnector.summarize_
+    conversation() returns None (LLM not configured, or a call failed),
+    so summarization always has a working answer, just a less fluent
+    one without the LLM.
+    """
+
+    def __init__(self):
+        pass
+
+    def is_llm_backed(self) -> bool:
+        return False
+
+    def summarize(self, text: str, max_sentences: int = 3) -> str:
+        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+        sentences = [s for s in sentences if len(s.split()) >= 3]
+        if not sentences:
+            return text.strip()
+        if len(sentences) <= max_sentences:
+            return " ".join(sentences)
+
+        try:
+            vectorizer = TfidfVectorizer(stop_words="english")
+            tfidf = vectorizer.fit_transform(sentences)
+            scores = np.asarray(tfidf.sum(axis=1)).ravel()
+        except ValueError:
+            # Can happen on very short/degenerate input (e.g. all
+            # stop words) - fall through to the word-frequency path.
+            scores = self._word_frequency_scores(sentences)
+
+        top_indices = sorted(np.argsort(scores)[-max_sentences:])
+        return " ".join(sentences[i] for i in top_indices)
+
+    @staticmethod
+    def _word_frequency_scores(sentences):
+        """Dependency-free fallback scorer, used only if TfidfVectorizer
+        raises on degenerate input (e.g. every sentence is pure stop
+        words): plain word-frequency sum per sentence, still a real
+        extractive-ranking signal, just without TF-IDF's IDF weighting."""
+        word_counts = Counter()
+        for s in sentences:
+            for w in re.findall(r"[a-zA-Z']+", s.lower()):
+                word_counts[w] += 1
+        scores = []
+        for s in sentences:
+            words = re.findall(r"[a-zA-Z']+", s.lower())
+            scores.append(sum(word_counts[w] for w in words) / max(1, len(words)))
+        return np.array(scores)
+
+
+# --- _RestApiClient (from 17_api_connectors.py) ---
+class _RestApiClient:
+    """
+    A minimal, dependency-free REST client shared by the connectors
+    below. Not a general HTTP library - just enough machinery (GET with
+    query params, JSON parsing, timeout, retry-with-backoff, a short
+    TTL cache) to avoid repeating the same 20 lines of urllib
+    boilerplate in every connector class.
+    """
+
+    def __init__(self, timeout_seconds: float = 8.0, cache_ttl_seconds: float = 120.0):
+        self.timeout_seconds = timeout_seconds
+        self.cache_ttl_seconds = cache_ttl_seconds
+        self._cache = {}  # url -> (fetched_at, parsed_json)
+
+    def get_json(self, url: str, params: dict = None, max_attempts: int = 2):
+        """
+        Performs a GET request and returns the parsed JSON body, or a
+        dict {"error": str} on any failure - callers check for the
+        "error" key rather than catching exceptions. Retries transient
+        failures (timeouts, 5xx) once with a short backoff, same
+        philosophy as LLMConnector.generate_reply_with_retry.
+        """
+        full_url = url
+        if params:
+            query = urllib.parse.urlencode(params)
+            full_url = f"{url}?{query}"
+
+        cached = self._cache.get(full_url)
+        if cached is not None:
+            fetched_at, payload = cached
+            if time.time() - fetched_at < self.cache_ttl_seconds:
+                return payload
+
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                request = urllib.request.Request(full_url, headers={"User-Agent": "offline-chatbot/1.0"})
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    if response.status != 200:
+                        last_error = f"HTTP {response.status}"
+                        continue
+                    body = response.read().decode("utf-8")
+                    payload = json.loads(body)
+                    self._cache[full_url] = (time.time(), payload)
+                    return payload
+            except urllib.error.HTTPError as e:
+                last_error = f"HTTP {e.code}"
+                if e.code < 500:
+                    break  # client errors (404, 400, ...) won't fix themselves on retry
+            except urllib.error.URLError as e:
+                last_error = f"couldn't reach the API ({e.reason})"
+            except TimeoutError:
+                last_error = "request timed out"
+            except (json.JSONDecodeError, ValueError) as e:
+                last_error = f"malformed response ({e})"
+                break  # a retry won't un-malform the same response
+            if attempt < max_attempts:
+                time.sleep(0.5 * attempt)
+
+        return {"error": last_error or "unknown error"}
+
+    def clear_cache(self):
+        self._cache = {}
+
+
+# --- WeatherAPIConnector (from 17_api_connectors.py) ---
+class WeatherAPIConnector:
+    """
+    Real current-weather + short forecast lookups via Open-Meteo
+    (open-meteo.com), chosen specifically because its core endpoints
+    need NO API key - reduces this to "does the bot have a network
+    connection" rather than also requiring config-file key management
+    like LLMConnector. Two real HTTP calls happen per lookup: one to
+    Open-Meteo's free geocoding endpoint (turns a place name into
+    latitude/longitude) and one to the forecast endpoint itself.
+    """
+
+    GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+    FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+    # A small subset of Open-Meteo's WMO weather codes, human-readable.
+    # (Full table has ~30 codes; these cover the common cases.)
+    _WEATHER_CODE_DESCRIPTIONS = {
+        0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+        45: "fog", 48: "depositing rime fog",
+        51: "light drizzle", 53: "moderate drizzle", 55: "dense drizzle",
+        61: "slight rain", 63: "moderate rain", 65: "heavy rain",
+        71: "slight snow", 73: "moderate snow", 75: "heavy snow",
+        80: "rain showers", 81: "moderate rain showers", 82: "violent rain showers",
+        95: "thunderstorm", 96: "thunderstorm with light hail", 99: "thunderstorm with heavy hail",
+    }
+
+    def __init__(self, client: _RestApiClient = None):
+        self.client = client or _shared_rest_client
+
+    def geocode(self, place_name: str):
+        """Returns {"name", "latitude", "longitude", "country"} for the
+        best-matching place, or None if nothing was found/reachable."""
+        result = self.client.get_json(self.GEOCODE_URL, params={"name": place_name, "count": 1})
+        if "error" in result:
+            return None
+        matches = result.get("results") or []
+        if not matches:
+            return None
+        top = matches[0]
+        return {
+            "name": top.get("name", place_name),
+            "latitude": top.get("latitude"),
+            "longitude": top.get("longitude"),
+            "country": top.get("country", ""),
+        }
+
+    def current_weather(self, place_name: str):
+        """Returns a dict with current temperature/weather description
+        for the given place, or {"error": str} on any failure."""
+        location = self.geocode(place_name)
+        if location is None:
+            return {"error": f"I couldn't find a place called '{place_name}'."}
+
+        result = self.client.get_json(self.FORECAST_URL, params={
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
+            "temperature_unit": "celsius",
+        })
+        if "error" in result:
+            return {"error": f"Couldn't reach the weather service ({result['error']})."}
+
+        current = result.get("current")
+        if not current:
+            return {"error": "Weather service returned an unexpected response shape."}
+
+        code = current.get("weather_code")
+        return {
+            "place": location["name"],
+            "country": location["country"],
+            "temperature_c": current.get("temperature_2m"),
+            "humidity_percent": current.get("relative_humidity_2m"),
+            "wind_speed_kmh": current.get("wind_speed_10m"),
+            "description": self._WEATHER_CODE_DESCRIPTIONS.get(code, "unknown conditions"),
+        }
+
+    def forecast(self, place_name: str, days: int = 3):
+        """Returns a real multi-day forecast (high/low temps,
+        conditions, precipitation chance per day) - Open-Meteo's daily
+        aggregation endpoint, same API/no-key setup as current_weather,
+        just a different set of query params. Added alongside the
+        broader push to make every online feature richer, not just
+        reachable."""
+        days = max(1, min(days, 7))  # Open-Meteo's free tier caps at 16; 7 is plenty for a chat reply
+        location = self.geocode(place_name)
+        if location is None:
+            return {"error": f"I couldn't find a place called '{place_name}'."}
+
+        result = self.client.get_json(self.FORECAST_URL, params={
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "temperature_unit": "celsius",
+            "forecast_days": days,
+        })
+        if "error" in result:
+            return {"error": f"Couldn't reach the weather service ({result['error']})."}
+
+        daily = result.get("daily")
+        if not daily or "time" not in daily:
+            return {"error": "Weather service returned an unexpected response shape."}
+
+        days_out = []
+        for i, date_str in enumerate(daily["time"]):
+            code = daily.get("weather_code", [None] * len(daily["time"]))[i]
+            days_out.append({
+                "date": date_str,
+                "high_c": daily.get("temperature_2m_max", [None])[i],
+                "low_c": daily.get("temperature_2m_min", [None])[i],
+                "precipitation_chance_percent": daily.get("precipitation_probability_max", [None])[i],
+                "description": self._WEATHER_CODE_DESCRIPTIONS.get(code, "unknown conditions"),
+            })
+
+        return {"place": location["name"], "country": location["country"], "days": days_out}
+
+    def format_current_weather(self, place_name: str) -> str:
+        result = self.current_weather(place_name)
+        if "error" in result:
+            return result["error"]
+        location_label = result["place"] + (f", {result['country']}" if result["country"] else "")
+        return (f"Weather in {location_label}: {result['description']}, "
+                f"{result['temperature_c']}°C, humidity {result['humidity_percent']}%, "
+                f"wind {result['wind_speed_kmh']} km/h.")
+
+    def format_forecast(self, place_name: str, days: int = 3) -> str:
+        result = self.forecast(place_name, days)
+        if "error" in result:
+            return result["error"]
+        location_label = result["place"] + (f", {result['country']}" if result["country"] else "")
+        lines = [f"{len(result['days'])}-day forecast for {location_label}:"]
+        for day in result["days"]:
+            rain_note = (f", {day['precipitation_chance_percent']}% chance of rain"
+                         if day["precipitation_chance_percent"] not in (None, 0) else "")
+            lines.append(f"  {day['date']}: {day['description']}, "
+                         f"{day['low_c']}-{day['high_c']}°C{rain_note}")
+        return "\n".join(lines)
+
+
+# --- CurrencyExchangeConnector (from 17_api_connectors.py) ---
+class CurrencyExchangeConnector:
+    """
+    Real currency conversion via the Frankfurter API (frankfurter.dev),
+    which republishes European Central Bank reference rates and, like
+    Open-Meteo, needs no API key. ECB rates update once per business
+    day, which this connector's 2-minute cache (via _RestApiClient)
+    comfortably respects without adding its own caching logic.
+    """
+
+    RATES_URL = "https://api.frankfurter.dev/v1/latest"
+    HISTORICAL_URL_TEMPLATE = "https://api.frankfurter.dev/v1/{date}"
+    CURRENCIES_URL = "https://api.frankfurter.dev/v1/currencies"
+
+    def __init__(self, client: _RestApiClient = None):
+        self.client = client or _shared_rest_client
+
+    def convert(self, amount: float, from_currency: str, to_currency: str):
+        from_currency = from_currency.upper().strip()
+        to_currency = to_currency.upper().strip()
+        result = self.client.get_json(self.RATES_URL, params={"base": from_currency, "symbols": to_currency})
+        if "error" in result:
+            return {"error": f"Couldn't reach the exchange rate service ({result['error']})."}
+
+        rates = result.get("rates", {})
+        rate = rates.get(to_currency)
+        if rate is None:
+            return {"error": f"No rate found for {from_currency} -> {to_currency}. Check the currency codes."}
+
+        return {
+            "amount": amount,
+            "from": from_currency,
+            "to": to_currency,
+            "rate": rate,
+            "converted": round(amount * rate, 2),
+            "date": result.get("date", "unknown"),
+        }
+
+    def convert_to_many(self, amount: float, from_currency: str, to_currencies: list):
+        """Converts to SEVERAL target currencies in one call, rather
+        than making the caller loop convert() once per currency -
+        Frankfurter supports a comma-separated 'symbols' param, so
+        this is one real HTTP request either way."""
+        from_currency = from_currency.upper().strip()
+        to_currencies = [c.upper().strip() for c in to_currencies]
+        result = self.client.get_json(self.RATES_URL, params={
+            "base": from_currency, "symbols": ",".join(to_currencies),
+        })
+        if "error" in result:
+            return {"error": f"Couldn't reach the exchange rate service ({result['error']})."}
+
+        rates = result.get("rates", {})
+        if not rates:
+            return {"error": f"No rates found for {from_currency}. Check the currency codes."}
+
+        conversions = {code: round(amount * rate, 2) for code, rate in rates.items()}
+        return {"amount": amount, "from": from_currency, "conversions": conversions,
+                "date": result.get("date", "unknown")}
+
+    def historical_comparison(self, amount: float, from_currency: str, to_currency: str, days_ago: int = 7):
+        """Compares today's rate against the rate `days_ago` days back,
+        so a conversion answer can say whether the currency has
+        strengthened or weakened recently - genuinely more useful than
+        a single static number, and Frankfurter's historical endpoint
+        (just a date in the URL path instead of 'latest') makes this a
+        second real HTTP call, not a guess."""
+        from_currency = from_currency.upper().strip()
+        to_currency = to_currency.upper().strip()
+
+        today_result = self.convert(amount, from_currency, to_currency)
+        if "error" in today_result:
+            return today_result
+
+        past_date = (dt.date.today() - dt.timedelta(days=days_ago)).isoformat()
+        past_result = self.client.get_json(
+            self.HISTORICAL_URL_TEMPLATE.format(date=past_date),
+            params={"base": from_currency, "symbols": to_currency},
+        )
+        if "error" in past_result:
+            # Historical data failing shouldn't sink the whole request -
+            # today's rate is still useful on its own.
+            today_result["historical_error"] = past_result["error"]
+            return today_result
+
+        past_rate = past_result.get("rates", {}).get(to_currency)
+        if past_rate is None:
+            today_result["historical_error"] = "no historical rate available for that date"
+            return today_result
+
+        change_percent = ((today_result["rate"] - past_rate) / past_rate) * 100
+        today_result["past_rate"] = past_rate
+        today_result["past_date"] = past_result.get("date", past_date)
+        today_result["change_percent"] = round(change_percent, 2)
+        return today_result
+
+    def list_currencies(self):
+        result = self.client.get_json(self.CURRENCIES_URL)
+        if "error" in result:
+            return {"error": f"Couldn't reach the exchange rate service ({result['error']})."}
+        return {"currencies": result}
+
+    def format_conversion(self, amount: float, from_currency: str, to_currency: str) -> str:
+        result = self.convert(amount, from_currency, to_currency)
+        if "error" in result:
+            return result["error"]
+        return (f"{result['amount']} {result['from']} = {result['converted']} {result['to']} "
+                f"(rate {result['rate']}, as of {result['date']}).")
+
+    def format_multi_conversion(self, amount: float, from_currency: str, to_currencies: list) -> str:
+        result = self.convert_to_many(amount, from_currency, to_currencies)
+        if "error" in result:
+            return result["error"]
+        lines = [f"{result['amount']} {result['from']} converts to (as of {result['date']}):"]
+        for code, converted in result["conversions"].items():
+            lines.append(f"  {converted} {code}")
+        return "\n".join(lines)
+
+    def format_historical_comparison(self, amount: float, from_currency: str, to_currency: str,
+                                      days_ago: int = 7) -> str:
+        result = self.historical_comparison(amount, from_currency, to_currency, days_ago)
+        if "error" in result:
+            return result["error"]
+        base = (f"{result['amount']} {result['from']} = {result['converted']} {result['to']} "
+                f"(rate {result['rate']}, as of {result['date']})")
+        if "change_percent" not in result:
+            note = result.get("historical_error", "no historical comparison available")
+            return f"{base}. ({note})"
+        direction = "stronger" if result["change_percent"] > 0 else "weaker"
+        return (f"{base}. {result['from']} is {abs(result['change_percent'])}% {direction} against "
+                f"{result['to']} than it was on {result['past_date']} "
+                f"(rate was {result['past_rate']}).")
+
+
+# --- OnlineTriviaConnector (from 17_api_connectors.py) ---
+class OnlineTriviaConnector:
+    """
+    Supplements FunExtras' offline TRIVIA bank (Section 6B) with fresh
+    questions from the Open Trivia Database (opentdb.com) - a free,
+    no-key-required trivia API. Explicitly a SUPPLEMENT, not a
+    replacement: FunExtras.random_trivia() (offline, instant, always
+    available) remains the default; this connector is only reached when
+    the caller specifically wants a fresh/online question, and always
+    fails closed back to the offline bank on any network problem.
+    """
+
+    API_URL = "https://opentdb.com/api.php"
+    CATEGORIES_URL = "https://opentdb.com/api_category.php"
+
+    # Open Trivia DB's actual response_code meanings - previously
+    # ignored entirely (only an empty results list was checked, which
+    # meant a rate-limited or "not enough questions for this category"
+    # response looked identical to a generic connection problem).
+    _RESPONSE_CODE_MESSAGES = {
+        1: "not enough questions exist for that category/difficulty combination",
+        2: "invalid parameter (check the category ID or difficulty)",
+        3: "session token not found",
+        4: "all available questions for this token have been used",
+        5: "rate limited by the trivia service - wait a few seconds and try again",
+    }
+
+    def __init__(self, client: _RestApiClient = None):
+        self.client = client or _shared_rest_client
+
+    @staticmethod
+    def _unescape(text: str) -> str:
+        """Open Trivia DB HTML-encodes special characters; this decodes
+        the small set that actually shows up in practice (quotes,
+        apostrophes, ampersands) without pulling in html.unescape's
+        full entity table for what's typically a handful of cases."""
+        replacements = {
+            "&quot;": '"', "&#039;": "'", "&amp;": "&",
+            "&eacute;": "é", "&uuml;": "ü", "&ntilde;": "ñ",
+        }
+        for entity, char in replacements.items():
+            text = text.replace(entity, char)
+        return text
+
+    def list_categories(self):
+        """Real category list from the API (34 categories as of
+        writing, e.g. 'Science: Computers', 'Sports', 'History') -
+        needed since fetch_question's category param takes a numeric
+        ID, not a free-text name."""
+        result = self.client.get_json(self.CATEGORIES_URL)
+        if "error" in result:
+            return {"error": f"Couldn't reach the trivia service ({result['error']})."}
+        categories = result.get("trivia_categories")
+        if not categories:
+            return {"error": "Trivia service returned an unexpected response shape."}
+        return {"categories": [(c["id"], c["name"]) for c in categories]}
+
+    def fetch_question(self, difficulty: str = None, category_id: int = None):
+        params = {"amount": 1, "type": "multiple"}
+        if difficulty in ("easy", "medium", "hard"):
+            params["difficulty"] = difficulty
+        if category_id is not None:
+            params["category"] = category_id
+
+        result = self.client.get_json(self.API_URL, params=params)
+        if "error" in result:
+            return {"error": f"Couldn't reach the online trivia service ({result['error']})."}
+
+        # BUGFIX: response_code was never actually checked - a
+        # rate-limited or "no questions match this filter" response
+        # (which still comes back as HTTP 200 with an empty results
+        # list) was indistinguishable from "the service is down",
+        # giving a misleading error message either way.
+        response_code = result.get("response_code")
+        if response_code and response_code != 0:
+            reason = self._RESPONSE_CODE_MESSAGES.get(response_code, f"response code {response_code}")
+            return {"error": f"Couldn't get a trivia question ({reason})."}
+
+        results = result.get("results") or []
+        if not results:
+            return {"error": "The trivia service didn't return a question."}
+
+        item = results[0]
+        question = self._unescape(item.get("question", ""))
+        correct = self._unescape(item.get("correct_answer", ""))
+        incorrect = [self._unescape(a) for a in item.get("incorrect_answers", [])]
+        choices = incorrect + [correct]
+        random.shuffle(choices)
+
+        return {
+            "question": question,
+            "choices": choices,
+            "answer": correct.lower(),
+            "category": item.get("category", ""),
+            "difficulty": item.get("difficulty", ""),
+        }
+
+    def format_question(self, difficulty: str = None, category_id: int = None) -> str:
+        result = self.fetch_question(difficulty, category_id)
+        if "error" in result:
+            return result["error"]
+        letters = ["A", "B", "C", "D"]
+        lines = [f"[{result['category']}, {result['difficulty']}] {result['question']}"]
+        for letter, choice in zip(letters, result["choices"]):
+            lines.append(f"  {letter}) {choice}")
+        return "\n".join(lines)
+
+    def format_categories(self) -> str:
+        result = self.list_categories()
+        if "error" in result:
+            return result["error"]
+        lines = ["Trivia categories:"]
+        for cat_id, name in result["categories"]:
+            lines.append(f"  {cat_id}: {name}")
+        return "\n".join(lines)
+
+
+# --- TranslationAPIConnector (from 17_api_connectors.py) ---
+class TranslationAPIConnector:
+    """
+    Machine translation with TWO backends:
+      - MyMemory (api.mymemory.translated.net) - free, no API key,
+        used by DEFAULT. Rate-limited (1,000 words/day anonymously)
+        but that's a perfectly reasonable ceiling for a chat feature,
+        and it means translation now genuinely works with zero setup,
+        unlike the LibreTranslate-only version of this connector.
+      - LibreTranslate - opt-in, config-file based (same pattern as
+        LLMConnector), for anyone who wants a self-hosted instance or
+        has their own API key and prefers it over MyMemory.
+    MyMemory is tried first whenever LibreTranslate isn't explicitly
+    enabled in the config, so 'translate to spanish: hello' works
+    immediately rather than needing any setup at all. Kept clearly
+    separate from LanguageDetector (Section 7B), which only DETECTS a
+    language via a fixed keyword dictionary and never translates -
+    actual translation needs a real model, which is exactly what this
+    connector calls out to (either backend).
+    """
+
+    DEFAULT_ENDPOINT = "https://libretranslate.com/translate"
+    MYMEMORY_URL = "https://api.mymemory.translated.net/get"
+
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self.config = self._load_or_create_config()
+        self.client = _RestApiClient(cache_ttl_seconds=3600.0)  # translations of the same text don't change
+
+    def _load_or_create_config(self):
+        template = {
+            "_instructions": (
+                "Translation works out of the box via the free MyMemory API "
+                "(no setup needed, ~1000 words/day). To use LibreTranslate "
+                "instead (e.g. a self-hosted instance, or your own API key "
+                "for higher limits), set 'use_libretranslate' to true and "
+                "fill in 'endpoint'/'api_key'."
+            ),
+            "use_libretranslate": False,
+            "endpoint": self.DEFAULT_ENDPOINT,
+            "api_key": "",
+        }
+        if not os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "w", encoding="utf-8") as f:
+                    json.dump(template, f, indent=2, ensure_ascii=False)
+            except OSError:
+                pass
+            return template
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            merged = dict(template)
+            merged.update(data)
+            return merged
+        except (json.JSONDecodeError, OSError):
+            return template
+
+    def is_available(self) -> bool:
+        # Always available now (MyMemory needs no config) - kept as a
+        # method rather than removed outright since other code may
+        # still call it expecting a capability check.
+        return True
+
+    def _translate_mymemory(self, text: str, target_lang: str, source_lang: str):
+        # MyMemory wants ISO 639-1 codes joined with '|', and "auto"
+        # isn't a real source option for it the way it is for
+        # LibreTranslate - default to English as a reasonable guess
+        # when the caller passes "auto", since most callers in this
+        # bot are translating FROM whatever LanguageDetector already
+        # identified, not truly unknown text.
+        source = "en" if source_lang == "auto" else source_lang
+        result = self.client.get_json(self.MYMEMORY_URL, params={
+            "q": text, "langpair": f"{source}|{target_lang}",
+        })
+        if "error" in result:
+            return {"error": f"Couldn't reach the translation API ({result['error']})."}
+
+        response_data = result.get("responseData", {})
+        translated = response_data.get("translatedText")
+        response_status = result.get("responseStatus")
+        if not translated or (response_status and response_status != 200):
+            return {"error": "Translation API returned an unexpected response shape."}
+        return {"translated_text": translated}
+
+    def _translate_libretranslate(self, text: str, target_lang: str, source_lang: str):
+        payload = {"q": text, "source": source_lang, "target": target_lang, "format": "text"}
+        if self.config.get("api_key"):
+            payload["api_key"] = self.config["api_key"]
+
+        try:
+            body = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                self.config["endpoint"], data=body, method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=8) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return {"error": f"Translation API returned HTTP {e.code}"}
+        except urllib.error.URLError as e:
+            return {"error": f"Couldn't reach the translation API ({e.reason})"}
+        except (TimeoutError, json.JSONDecodeError, KeyError) as e:
+            return {"error": f"Translation request failed ({e})"}
+
+        translated = data.get("translatedText")
+        if not translated:
+            return {"error": "Translation API returned an unexpected response shape."}
+        return {"translated_text": translated}
+
+    def translate(self, text: str, target_lang: str, source_lang: str = "auto"):
+        if self.config.get("use_libretranslate") and self.config.get("endpoint"):
+            result = self._translate_libretranslate(text, target_lang, source_lang)
+            if "error" not in result:
+                return result
+            # Fall through to MyMemory rather than failing outright if
+            # the configured LibreTranslate instance is unreachable.
+        return self._translate_mymemory(text, target_lang, source_lang)
+
+    def format_translation(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
+        result = self.translate(text, target_lang, source_lang)
+        if "error" in result:
+            return result["error"]
+        return result["translated_text"]
+
+
+# --- NewsHeadlinesConnector (from 17_api_connectors.py) ---
+class NewsHeadlinesConnector:
+    """
+    Fetches current top-story headlines via the Hacker News Firebase
+    API (hacker-news.firebaseio.com) - like Open-Meteo and Frankfurter,
+    this needs NO API key, so it's usable with zero config. Two-stage
+    fetch, same shape as most feed-style REST APIs: one call for a list
+    of story IDs, then one call per ID for the story details - capped
+    at a small number of items so a single "what's in the news" request
+    doesn't turn into dozens of HTTP calls.
+    """
+
+    TOP_STORIES_URL = "https://hacker-news.firebaseio.com/v0/topstories.json"
+    ITEM_URL_TEMPLATE = "https://hacker-news.firebaseio.com/v0/item/{item_id}.json"
+    # HN's Firebase API exposes several story feeds beyond "top" - all
+    # free, same endpoint shape, just a different list. Added so "top
+    # headlines" isn't the only option.
+    _STORY_TYPE_URLS = {
+        "top": "https://hacker-news.firebaseio.com/v0/topstories.json",
+        "best": "https://hacker-news.firebaseio.com/v0/beststories.json",
+        "new": "https://hacker-news.firebaseio.com/v0/newstories.json",
+        "ask": "https://hacker-news.firebaseio.com/v0/askstories.json",
+        "show": "https://hacker-news.firebaseio.com/v0/showstories.json",
+    }
+
+    def __init__(self, client: _RestApiClient = None):
+        self.client = client or _shared_rest_client
+
+    def top_headlines(self, limit: int = 5, story_type: str = "top"):
+        limit = max(1, min(limit, 10))
+        story_type = story_type if story_type in self._STORY_TYPE_URLS else "top"
+        story_ids = self.client.get_json(self._STORY_TYPE_URLS[story_type])
+        if isinstance(story_ids, dict) and "error" in story_ids:
+            return {"error": f"Couldn't reach the news service ({story_ids['error']})."}
+        if not isinstance(story_ids, list) or not story_ids:
+            return {"error": "News service returned an unexpected response shape."}
+
+        headlines = []
+        for item_id in story_ids[:limit]:
+            item = self.client.get_json(self.ITEM_URL_TEMPLATE.format(item_id=item_id))
+            if isinstance(item, dict) and "error" not in item and item.get("title"):
+                headlines.append({
+                    "title": item["title"],
+                    "url": item.get("url", f"https://news.ycombinator.com/item?id={item_id}"),
+                    "score": item.get("score", 0),
+                })
+        if not headlines:
+            return {"error": "Couldn't fetch any headline details."}
+        return {"headlines": headlines, "story_type": story_type}
+
+    def format_headlines(self, limit: int = 5, story_type: str = "top") -> str:
+        result = self.top_headlines(limit, story_type)
+        if "error" in result:
+            return result["error"]
+        label = {"top": "TOP HEADLINES", "best": "BEST STORIES", "new": "NEWEST STORIES",
+                  "ask": "ASK HN", "show": "SHOW HN"}.get(result["story_type"], "HEADLINES")
+        lines = [f"{label} (Hacker News)", ""]
+        for i, item in enumerate(result["headlines"], start=1):
+            lines.append(f"  {i}. {item['title']} ({item['score']} points)")
+            lines.append(f"     {item['url']}")
+        return "\n".join(lines)
+
+
+# --- RealPhotoConnector (from 17_api_connectors.py) ---
+class RealPhotoConnector:
+    """
+    Fetches an actual, real, openly-licensed PHOTOGRAPH matching a
+    search query via Openverse (openverse.org - the Creative Commons
+    image search API WordPress runs), rather than generating one.
+    Chosen specifically because its search endpoint needs NO API key,
+    same reasoning as WeatherAPIConnector above.
+
+    This is the honest answer to "make the CNN generate actual
+    photos": no from-scratch, phone-trainable model actually produces
+    real photographs - that needs a large pretrained diffusion/GAN
+    model (gigabytes of weights, real GPU compute, and typically a
+    paid API), none of which fits this project's offline-first, no-
+    API-key-required design. What CAN honestly deliver a genuine
+    photograph is fetching a REAL one, correctly licensed for reuse -
+    so that's what this does, with CNNImageGenerator's procedural
+    renderer (Section 12B) as the automatic fallback whenever there's
+    no network, the API is unreachable, or nothing licensed for reuse
+    matches the query. Every image returned includes its photographer
+    credit and license, since that's a condition of the CC licenses
+    Openverse indexes.
+    """
+
+    SEARCH_URL = "https://api.openverse.org/v1/images/"
+
+    # Maps this bot's abstract shape vocabulary to a real-world,
+    # PHOTOGRAPHABLE object noun - searching Openverse for "red circle"
+    # mostly returns clip art/vector graphics (since that's what
+    # actually gets tagged that way), while "red ball" returns actual
+    # photographs of physical objects.
+    SHAPE_TO_OBJECT_NOUN = {
+        "circle": "ball",
+        "square": "cube block",
+        "triangle": "pyramid",
+    }
+
+    def __init__(self, client: _RestApiClient = None):
+        self.client = client or _shared_rest_client
+
+    def search(self, query: str):
+        """Returns {"url", "title", "creator", "license"} for the
+        top reusable-photo match, or {"error": str} on any failure -
+        including "no results", which is a normal, expected outcome
+        for an unusual query, not a bug."""
+        result = self.client.get_json(self.SEARCH_URL, params={
+            "q": query,
+            "page_size": 1,
+            # Restricting to actual photographs (not illustrations,
+            # digitized art, or 3D renders) is the whole point here -
+            # this filter is what makes the result an honest "photo".
+            "category": "photograph",
+            "license_type": "commercial,modification",
+        })
+        if "error" in result:
+            return {"error": f"couldn't reach the photo search service ({result['error']})"}
+
+        matches = result.get("results") or []
+        if not matches:
+            return {"error": f"no reusable photo found for '{query}'"}
+
+        top = matches[0]
+        return {
+            "url": top.get("url"),
+            "title": top.get("title", query),
+            "creator": top.get("creator", "unknown"),
+            "license": (top.get("license", "") or "").upper(),
+        }
+
+    def fetch_and_save(self, shape: str, color: str, output_path: str):
+        """Searches for a real photo of '{color} {object noun for
+        shape}' and downloads it to output_path. Returns
+        {"path", "title", "creator", "license"} on success, or
+        {"error": str} on any failure (network, no results, bad image
+        data) - callers should fall back to CNNImageGenerator on any
+        error dict, exactly like every other connector in this file.
+
+        Retries with just the object noun (no color) if the exact
+        color+object query comes back empty - "red pyramid" is a much
+        narrower search than "pyramid", and a real photo of some other
+        color is still far more useful than no photo at all, as long
+        as the fallback is disclosed (see the returned "note" field)."""
+        object_noun = self.SHAPE_TO_OBJECT_NOUN.get(shape, shape)
+        query = f"{color} {object_noun}"
+
+        found = self.search(query)
+        used_fallback_query = False
+        if "error" in found:
+            found = self.search(object_noun)
+            used_fallback_query = True
+            if "error" in found:
+                return found
+
+        image_url = found.get("url")
+        if not image_url:
+            return {"error": "search result had no image URL"}
+
+        try:
+            request = urllib.request.Request(image_url, headers={"User-Agent": "offline-chatbot/1.0"})
+            with urllib.request.urlopen(request, timeout=self.client.timeout_seconds) as response:
+                if response.status != 200:
+                    return {"error": f"image download failed (HTTP {response.status})"}
+                image_bytes = response.read()
+        except (urllib.error.URLError, TimeoutError) as e:
+            return {"error": f"couldn't download the image ({e})"}
+
+        if not PILLOW_AVAILABLE:
+            return {"error": "Pillow isn't installed, so the downloaded image can't be processed"}
+        try:
+            with open(output_path, "wb") as f:
+                f.write(image_bytes)
+            # Round-trip through PIL once, both to validate it's a real,
+            # decodable image (not an HTML error page or truncated
+            # download) and to normalize it to RGB at a consistent size,
+            # same as every image this bot saves.
+            img = Image.open(output_path).convert("RGB")
+            img = img.resize((GENERATOR_IMAGE_SIZE, GENERATOR_IMAGE_SIZE), Image.LANCZOS)
+            img.save(output_path)
+        except Exception as e:
+            return {"error": f"downloaded file wasn't a valid image ({e})"}
+
+        result = {
+            "path": output_path, "title": found["title"],
+            "creator": found["creator"], "license": found["license"],
+        }
+        if used_fallback_query:
+            result["note"] = f"no '{query}' photo found, so this is just '{object_noun}' instead"
+        return result
+
+
+# --- QRCodeGenerator (from 18_qr_code.py) ---
+class QRCodeGenerator:
+    """From-scratch ISO/IEC 18004 QR code encoder - see the Section 13C
+    module docstring above for scope and the honesty note on
+    verification status."""
+
+    # ---- GF(256) arithmetic for Reed-Solomon error correction --------------
+    _GF_EXP = [0] * 512
+    _GF_LOG = [0] * 256
+
+    @classmethod
+    def _init_gf(cls):
+        x = 1
+        for i in range(255):
+            cls._GF_EXP[i] = x
+            cls._GF_LOG[x] = i
+            x <<= 1
+            if x & 0x100:
+                x ^= 0x11D  # the QR code spec's primitive polynomial
+        for i in range(255, 512):
+            cls._GF_EXP[i] = cls._GF_EXP[i - 255]
+
+    @classmethod
+    def _gf_mul(cls, a, b):
+        if a == 0 or b == 0:
+            return 0
+        return cls._GF_EXP[cls._GF_LOG[a] + cls._GF_LOG[b]]
+
+    @classmethod
+    def _rs_generator_poly(cls, num_ec):
+        poly = [1]
+        for i in range(num_ec):
+            new_poly = [0] * (len(poly) + 1)
+            for j, coef in enumerate(poly):
+                new_poly[j] ^= cls._gf_mul(coef, cls._GF_EXP[i])
+                new_poly[j + 1] ^= coef
+            poly = new_poly
+        return poly
+
+    @classmethod
+    def _rs_encode(cls, data, num_ec):
+        # BUGFIX: _rs_generator_poly() builds the polynomial ascending
+        # (poly[k] = coefficient of x^k), but the long-division loop
+        # below walks it MSB-first (highest-degree term first), which
+        # requires descending order. Without the reverse, every QR code
+        # this generated had correct data codewords but wrong
+        # error-correction codewords, so the finder/timing/format
+        # pattern all looked right but real scanners couldn't decode
+        # the payload. Reversing here fixes it - verified against
+        # OpenCV's QRCodeEncoder as a reference.
+        gen = list(reversed(cls._rs_generator_poly(num_ec)))
+        msg = list(data) + [0] * num_ec
+        for i in range(len(data)):
+            coef = msg[i]
+            if coef != 0:
+                for j, g in enumerate(gen):
+                    msg[i + j] ^= cls._gf_mul(g, coef)
+        return msg[len(data):]
+
+    # ---- version tables (EC level L, single-block versions 1-5 only) ------
+    VERSION_INFO_L = {
+        1: (26, 7, 19), 2: (44, 10, 34), 3: (70, 15, 55),
+        4: (100, 20, 80), 5: (134, 26, 108),
+    }  # version: (total_codewords, ec_codewords, data_codewords)
+    MODULES_PER_SIDE = {1: 21, 2: 25, 3: 29, 4: 33, 5: 37}
+    ALIGNMENT_POSITIONS = {1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30]}
+    FORMAT_EC_BITS = {"L": 0b01, "M": 0b00, "Q": 0b11, "H": 0b10}
+
+    @classmethod
+    def _choose_version(cls, data_len):
+        for version, (_total, _ec, data_cap) in cls.VERSION_INFO_L.items():
+            header_bits = 4 + 8  # mode indicator + byte-mode character count
+            available_bits = data_cap * 8 - header_bits
+            if data_len <= available_bits // 8:
+                return version
+        return None
+
+    @classmethod
+    def _build_data_codewords(cls, data_bytes, version):
+        _total, _ec, data_cap = cls.VERSION_INFO_L[version]
+        bits = [0, 1, 0, 0]  # mode indicator: byte mode
+        count = len(data_bytes)
+        bits.extend([(count >> i) & 1 for i in range(7, -1, -1)])
+        for byte in data_bytes:
+            bits.extend([(byte >> i) & 1 for i in range(7, -1, -1)])
+
+        capacity_bits = data_cap * 8
+        remaining = capacity_bits - len(bits)
+        bits.extend([0] * max(0, min(4, remaining)))
+        while len(bits) % 8 != 0:
+            bits.append(0)
+        pad_bytes = [0xEC, 0x11]
+        i = 0
+        while len(bits) < capacity_bits:
+            byte = pad_bytes[i % 2]
+            bits.extend([(byte >> b) & 1 for b in range(7, -1, -1)])
+            i += 1
+        bits = bits[:capacity_bits]
+
+        codewords = []
+        for i in range(0, len(bits), 8):
+            byte = 0
+            for b in bits[i:i + 8]:
+                byte = (byte << 1) | b
+            codewords.append(byte)
+        return codewords
+
+    @classmethod
+    def _encode_bitstream(cls, text, version=None):
+        data_bytes = list(text.encode("utf-8"))
+        if version is None:
+            version = cls._choose_version(len(data_bytes))
+        if version is None:
+            return None, None
+
+        _total, num_ec, _data_cap = cls.VERSION_INFO_L[version]
+        data_codewords = cls._build_data_codewords(data_bytes, version)
+        ec_codewords = cls._rs_encode(data_codewords, num_ec)
+        all_codewords = data_codewords + ec_codewords
+
+        bitstream = []
+        for cw in all_codewords:
+            bitstream.extend([(cw >> i) & 1 for i in range(7, -1, -1)])
+        remainder_bits = {1: 0, 2: 7, 3: 7, 4: 7, 5: 7}[version]
+        bitstream.extend([0] * remainder_bits)
+        return bitstream, version
+
+    @staticmethod
+    def _place_finder_pattern(matrix, top, left):
+        for r in range(-1, 8):
+            for c in range(-1, 8):
+                rr, cc = top + r, left + c
+                if not (0 <= rr < matrix.shape[0] and 0 <= cc < matrix.shape[1]):
+                    continue
+                if r in (-1, 7) or c in (-1, 7):
+                    matrix[rr, cc] = 0
+                elif r in (0, 6) or c in (0, 6):
+                    matrix[rr, cc] = 1
+                elif 2 <= r <= 4 and 2 <= c <= 4:
+                    matrix[rr, cc] = 1
+                else:
+                    matrix[rr, cc] = 0
+
+    @staticmethod
+    def _place_alignment_pattern(matrix, center_r, center_c):
+        for r in range(-2, 3):
+            for c in range(-2, 3):
+                rr, cc = center_r + r, center_c + c
+                if r in (-2, 2) or c in (-2, 2) or (r == 0 and c == 0):
+                    matrix[rr, cc] = 1
+                else:
+                    matrix[rr, cc] = 0
+
+    @staticmethod
+    def _apply_mask(pattern, row, col, bit):
+        conditions = {
+            0: (row + col) % 2 == 0,
+            1: row % 2 == 0,
+            2: col % 3 == 0,
+            3: (row + col) % 3 == 0,
+            4: ((row // 2) + (col // 3)) % 2 == 0,
+            5: (row * col) % 2 + (row * col) % 3 == 0,
+            6: ((row * col) % 2 + (row * col) % 3) % 2 == 0,
+            7: ((row + col) % 2 + (row * col) % 3) % 2 == 0,
+        }
+        return bit ^ 1 if conditions.get(pattern, False) else bit
+
+    @classmethod
+    def _build_matrix(cls, bitstream, version, mask_pattern):
+        size = cls.MODULES_PER_SIDE[version]
+        matrix = np.full((size, size), -1, dtype=np.int8)  # -1 = not yet placed
+
+        cls._place_finder_pattern(matrix, 0, 0)
+        cls._place_finder_pattern(matrix, 0, size - 7)
+        cls._place_finder_pattern(matrix, size - 7, 0)
+
+        for i in range(8, size - 8):
+            matrix[6, i] = 1 if i % 2 == 0 else 0
+            matrix[i, 6] = 1 if i % 2 == 0 else 0
+
+        aligns = cls.ALIGNMENT_POSITIONS[version]
+        for ar in aligns:
+            for ac in aligns:
+                if (ar <= 8 and ac <= 8) or (ar <= 8 and ac >= size - 9) or (ar >= size - 9 and ac <= 8):
+                    continue  # skip positions that would overlap a finder pattern
+                cls._place_alignment_pattern(matrix, ar, ac)
+
+        dark_row = 4 * version + 9
+        matrix[dark_row, 8] = 1
+
+        for i in range(9):
+            if matrix[8, i] == -1:
+                matrix[8, i] = 0
+            if matrix[i, 8] == -1:
+                matrix[i, 8] = 0
+        for i in range(8):
+            if matrix[8, size - 1 - i] == -1:
+                matrix[8, size - 1 - i] = 0
+            if matrix[size - 1 - i, 8] == -1:
+                matrix[size - 1 - i, 8] = 0
+
+        bit_idx = 0
+        col = size - 1
+        upward = True
+        while col > 0:
+            if col == 6:
+                col -= 1  # column 6 is the vertical timing pattern - never used for data
+            for i in range(size):
+                row = (size - 1 - i) if upward else i
+                for c in (col, col - 1):
+                    if matrix[row, c] == -1:
+                        bit = bitstream[bit_idx] if bit_idx < len(bitstream) else 0
+                        bit_idx += 1
+                        matrix[row, c] = cls._apply_mask(mask_pattern, row, c, bit)
+            upward = not upward
+            col -= 2
+
+        return matrix
+
+    @classmethod
+    def _format_info_bits(cls, ec_level, mask_pattern):
+        data = (cls.FORMAT_EC_BITS[ec_level] << 3) | mask_pattern
+        generator = 0x537
+        val = data << 10
+        for i in range(4, -1, -1):
+            if val & (1 << (i + 10)):
+                val ^= generator << i
+        fmt = (data << 10) | val
+        fmt ^= 0b101010000010010  # the spec's fixed XOR mask for format info
+        return [(fmt >> i) & 1 for i in range(14, -1, -1)]
+
+    @classmethod
+    def _place_format_info(cls, matrix, ec_level, mask_pattern):
+        bits = cls._format_info_bits(ec_level, mask_pattern)
+        size = matrix.shape[0]
+        positions_a = [(8, 0), (8, 1), (8, 2), (8, 3), (8, 4), (8, 5), (8, 7), (8, 8),
+                       (7, 8), (5, 8), (4, 8), (3, 8), (2, 8), (1, 8), (0, 8)]
+        for bit, (r, c) in zip(bits, positions_a):
+            matrix[r, c] = bit
+        positions_b = [(size - 1, 8), (size - 2, 8), (size - 3, 8), (size - 4, 8),
+                       (size - 5, 8), (size - 6, 8), (size - 7, 8),
+                       (8, size - 8), (8, size - 7), (8, size - 6), (8, size - 5),
+                       (8, size - 4), (8, size - 3), (8, size - 2), (8, size - 1)]
+        for bit, (r, c) in zip(bits, positions_b):
+            matrix[r, c] = bit
+
+    @classmethod
+    def generate_matrix(cls, text: str, ec_level: str = "L", mask_pattern: int = 0):
+        """Returns a 2D numpy array of 0/1 QR modules, or None if the
+        text is too long for the supported versions (1-5, roughly 100
+        bytes)."""
+        bitstream, version = cls._encode_bitstream(text)
+        if bitstream is None:
+            return None
+        matrix = cls._build_matrix(bitstream, version, mask_pattern)
+        cls._place_format_info(matrix, ec_level, mask_pattern)
+        return matrix
+
+    @classmethod
+    def generate_image(cls, text: str, scale: int = 10, quiet_zone: int = 4):
+        """Renders the QR matrix to a PIL Image (black/white modules,
+        scaled up, with the required quiet-zone border), or a dict
+        {"error": str} if the text won't fit."""
+        if not PILLOW_AVAILABLE:
+            return {"error": "Pillow isn't installed, so QR image rendering isn't available."}
+        matrix = cls.generate_matrix(text)
+        if matrix is None:
+            return {"error": "That text is too long for this QR generator (roughly a 100-byte / short-URL limit)."}
+
+        size = matrix.shape[0]
+        full_size = size + quiet_zone * 2
+        img_array = np.full((full_size, full_size), 255, dtype=np.uint8)
+        img_array[quiet_zone:quiet_zone + size, quiet_zone:quiet_zone + size] = np.where(matrix == 1, 0, 255)
+        scaled = np.kron(img_array, np.ones((scale, scale), dtype=np.uint8))
+        return Image.fromarray(scaled, mode="L")
+
+    @classmethod
+    def format_generate(cls, text: str, output_path: str) -> str:
+        result = cls.generate_image(text)
+        if isinstance(result, dict) and "error" in result:
+            return result["error"]
+        try:
+            result.save(output_path)
+        except Exception as e:
+            return f"Generated the QR code but couldn't save it: {e}"
+        return (f"Generated a QR code for '{text}' and saved it to {output_path}. "
+                f"(Rule-based, no ML involved - if it doesn't scan, try a shorter payload "
+                f"or a different scanner app.)")
+
+
+# --- DictionaryAPIConnector (from 18_qr_code.py) ---
+class DictionaryAPIConnector:
+    """
+    Real word definitions via the Free Dictionary API
+    (dictionaryapi.dev) - another no-key-required public API, following
+    the exact same _RestApiClient pattern as the other connectors in
+    this section. Returns definitions, part of speech, and (when
+    present) a phonetic spelling, pulling from the first matching entry
+    the API returns.
+    """
+
+    API_URL_TEMPLATE = "https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
+
+    def __init__(self, client: _RestApiClient = None):
+        self.client = client or _shared_rest_client
+
+    def define(self, word: str):
+        word = word.strip().lower()
+        if not word:
+            return {"error": "Give me a word to define."}
+
+        result = self.client.get_json(self.API_URL_TEMPLATE.format(word=urllib.parse.quote(word)))
+        if isinstance(result, dict) and "error" in result:
+            return {"error": f"Couldn't reach the dictionary service ({result['error']})."}
+        if not isinstance(result, list) or not result:
+            return {"error": f"I couldn't find a definition for '{word}'."}
+
+        entry = result[0]
+        phonetic = entry.get("phonetic", "")
+        if not phonetic:
+            # "phonetic" is sometimes empty even when a per-entry
+            # phonetics list has one - check there before giving up.
+            for p in entry.get("phonetics", []):
+                if p.get("text"):
+                    phonetic = p["text"]
+                    break
+
+        meanings = []
+        for meaning in entry.get("meanings", []):
+            part_of_speech = meaning.get("partOfSpeech", "")
+            definitions = meaning.get("definitions", [])
+            # Up to 2 definitions per part of speech now (was 1) - a
+            # word like "run" has meaningfully different senses within
+            # the same part of speech, and only ever showing the very
+            # first one undersold that.
+            defs_out = []
+            synonyms = set(meaning.get("synonyms", []))
+            for d in definitions[:2]:
+                defs_out.append({"definition": d.get("definition", ""), "example": d.get("example")})
+                synonyms.update(d.get("synonyms", []))
+            if defs_out:
+                meanings.append({
+                    "part_of_speech": part_of_speech,
+                    "definitions": defs_out,
+                    "synonyms": sorted(synonyms)[:5],  # a handful is plenty for a chat reply
+                })
+
+        if not meanings:
+            return {"error": f"I couldn't find a usable definition for '{word}'."}
+
+        return {"word": word, "phonetic": phonetic, "meanings": meanings}
+
+    def format_definition(self, word: str) -> str:
+        result = self.define(word)
+        if "error" in result:
+            return result["error"]
+        lines = [f"{result['word']}" + (f"  {result['phonetic']}" if result["phonetic"] else "")]
+        for meaning in result["meanings"][:3]:
+            lines.append(f"  ({meaning['part_of_speech']})")
+            for d in meaning["definitions"]:
+                lines.append(f"    - {d['definition']}")
+                if d.get("example"):
+                    lines.append(f"      e.g. \"{d['example']}\"")
+            if meaning["synonyms"]:
+                lines.append(f"    synonyms: {', '.join(meaning['synonyms'])}")
+        return "\n".join(lines)
+
+
+# --- CipherTools (from 25_cipher_tools.py) ---
+class CipherTools:
+    # ---- Caesar / ROT13 -----------------------------------------------
+
+    @staticmethod
+    def caesar(text: str, shift: int) -> str:
+        shift %= 26
+        out = []
+        for ch in text:
+            if ch.isupper():
+                out.append(chr((ord(ch) - ord("A") + shift) % 26 + ord("A")))
+            elif ch.islower():
+                out.append(chr((ord(ch) - ord("a") + shift) % 26 + ord("a")))
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    @classmethod
+    def rot13(cls, text: str) -> str:
+        return cls.caesar(text, 13)
+
+    @staticmethod
+    def caesar_brute_force(ciphertext: str) -> str:
+        """Tries all 26 shifts - useful when you don't know the shift
+        used to encode a Caesar-ciphered message."""
+        lines = []
+        for shift in range(26):
+            lines.append(f"shift {shift:2d}: {CipherTools.caesar(ciphertext, -shift)}")
+        return "\n".join(lines)
+
+    # ---- Vigenere -------------------------------------------------------
+
+    @staticmethod
+    def _vigenere_transform(text: str, keyword: str, decode: bool) -> str:
+        keyword = "".join(ch for ch in keyword.upper() if ch.isalpha())
+        if not keyword:
+            return text
+        out = []
+        key_index = 0
+        for ch in text:
+            if ch.isalpha():
+                shift = ord(keyword[key_index % len(keyword)]) - ord("A")
+                if decode:
+                    shift = -shift
+                base = ord("A") if ch.isupper() else ord("a")
+                out.append(chr((ord(ch) - base + shift) % 26 + base))
+                key_index += 1
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    @classmethod
+    def vigenere_encode(cls, text: str, keyword: str) -> str:
+        return cls._vigenere_transform(text, keyword, decode=False)
+
+    @classmethod
+    def vigenere_decode(cls, text: str, keyword: str) -> str:
+        return cls._vigenere_transform(text, keyword, decode=True)
+
+    # ---- Keyed substitution cipher ---------------------------------------
+
+    @staticmethod
+    def _substitution_alphabet(keyword: str) -> str:
+        keyword = "".join(ch for ch in keyword.upper() if ch.isalpha())
+        seen = []
+        for ch in keyword + _ALPHABET:
+            if ch not in seen:
+                seen.append(ch)
+        return "".join(seen)
+
+    @classmethod
+    def substitution_encode(cls, text: str, keyword: str) -> str:
+        cipher_alphabet = cls._substitution_alphabet(keyword)
+        mapping = {plain: cipher for plain, cipher in zip(_ALPHABET, cipher_alphabet)}
+        out = []
+        for ch in text:
+            if ch.isupper():
+                out.append(mapping[ch])
+            elif ch.islower():
+                out.append(mapping[ch.upper()].lower())
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    @classmethod
+    def substitution_decode(cls, text: str, keyword: str) -> str:
+        cipher_alphabet = cls._substitution_alphabet(keyword)
+        mapping = {cipher: plain for plain, cipher in zip(_ALPHABET, cipher_alphabet)}
+        out = []
+        for ch in text:
+            if ch.isupper():
+                out.append(mapping[ch])
+            elif ch.islower():
+                out.append(mapping[ch.upper()].lower())
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    # ---- Morse code -------------------------------------------------------
+
+    @staticmethod
+    def to_morse(text: str) -> str:
+        words = text.upper().split(" ")
+        encoded_words = []
+        for word in words:
+            letters = []
+            for ch in word:
+                if ch in _MORSE_TABLE:
+                    letters.append(_MORSE_TABLE[ch])
+                # silently skip characters with no Morse mapping
+                # (punctuation beyond digits/letters), rather than
+                # crashing or inserting an ambiguous placeholder
+            encoded_words.append(" ".join(letters))
+        return " / ".join(encoded_words)
+
+    @staticmethod
+    def from_morse(code: str) -> str:
+        words = code.strip().split(" / ")
+        decoded_words = []
+        for word in words:
+            letters = []
+            for token in word.split(" "):
+                if token in _MORSE_REVERSE:
+                    letters.append(_MORSE_REVERSE[token])
+            decoded_words.append("".join(letters))
+        return " ".join(decoded_words)
+
+
+# --- TipCalculator (from 26_billsplit_tip.py) ---
+class TipCalculator:
+    @staticmethod
+    def calculate(bill: float, tip_percent: float, num_people: int = 1, round_up: bool = False) -> str:
+        if bill < 0 or tip_percent < 0:
+            return "Bill amount and tip percent should both be zero or positive."
+        if num_people < 1:
+            return "Number of people to split between should be at least 1."
+
+        tip = bill * (tip_percent / 100)
+        total = bill + tip
+        per_person = total / num_people
+        if round_up:
+            import math
+            per_person = math.ceil(per_person * 100) / 100
+
+        lines = [
+            f"Bill: {bill:.2f}",
+            f"Tip ({tip_percent:g}%): {tip:.2f}",
+            f"Total: {total:.2f}",
+        ]
+        if num_people > 1:
+            lines.append(f"Split {num_people} ways: {per_person:.2f} each" +
+                         (" (rounded up)" if round_up else ""))
+        return "\n".join(lines)
+
+    @staticmethod
+    def calculate_itemized(items: dict, tip_percent: float) -> str:
+        """items: {person_name: their_subtotal_before_tip}. Each
+        person's tip is proportional to their share of the bill, so
+        the total tip still equals bill_total * tip_percent."""
+        if tip_percent < 0:
+            return "Tip percent should be zero or positive."
+        if not items:
+            return "I need at least one person's item subtotal to split the bill."
+        if any(v < 0 for v in items.values()):
+            return "Item subtotals should all be zero or positive."
+
+        bill_total = sum(items.values())
+        if bill_total == 0:
+            return "Everyone's subtotal is 0 - nothing to split."
+
+        lines = [f"Bill total: {bill_total:.2f}  |  Tip: {tip_percent:g}%"]
+        grand_total = 0.0
+        for name, subtotal in items.items():
+            share = subtotal / bill_total
+            person_tip = bill_total * (tip_percent / 100) * share
+            person_total = subtotal + person_tip
+            grand_total += person_total
+            lines.append(f"  {name}: subtotal {subtotal:.2f} + tip {person_tip:.2f} = {person_total:.2f}")
+        lines.append(f"Grand total: {grand_total:.2f}")
+        return "\n".join(lines)
+
+
+# --- NameGenerator (from 27_name_generator.py) ---
+class NameGenerator:
+    def __init__(self):
+        self._chain = _CharMarkovChain(_NAME_SEED_CORPUS)
+
+    def fantasy_name(self) -> str:
+        raw = self._chain.generate()
+        return raw[0].upper() + raw[1:].lower()
+
+    def username(self) -> str:
+        return f"{random.choice(_ADJECTIVES)}_{random.choice(_NOUNS)}{random.randint(1, 999)}"
+
+    def project_name(self) -> str:
+        return f"Project {random.choice(_ADJECTIVES).capitalize()} {random.choice(_PROJECT_NOUNS)}"
+
+    def format_batch(self, kind: str, count: int = 5) -> str:
+        count = max(1, min(count, 20))
+        generator = {"fantasy": self.fantasy_name, "username": self.username,
+                     "project": self.project_name}.get(kind, self.fantasy_name)
+        names = set()
+        attempts = 0
+        while len(names) < count and attempts < count * 10:
+            names.add(generator())
+            attempts += 1
+        return "\n".join(f"- {n}" for n in list(names)[:count])
+
+
+# --- AsciiArtGenerator (from 28_ascii_art.py) ---
+class AsciiArtGenerator:
+    MAX_BANNER_CHARS = 20
+    BOX_WRAP_WIDTH = 30
+
+    def banner(self, text: str) -> str:
+        text = text.upper()[: self.MAX_BANNER_CHARS]
+        if not text:
+            return "Give me some text to turn into a banner."
+        rows = ["", "", "", "", ""]
+        for ch in text:
+            glyph = _FONT.get(ch, _FONT[" "])
+            for i in range(5):
+                rows[i] += glyph[i] + "  "
+        return "\n".join(rows)
+
+    def shape(self, name: str, size: int = 5) -> str:
+        name = name.lower().strip()
+        if name not in _SHAPES:
+            return f"I can draw a triangle, square, diamond, star, or heart - not '{name}'."
+        size = max(1, min(size, 15))
+        return _SHAPES[name](size)
+
+    def box(self, text: str, width: int = None) -> str:
+        """Word-wraps text to `width` columns and draws a box-drawing
+        border around it - simple word-wrap algorithm (greedy line
+        filling) plus border rendering, rather than a single fixed
+        template."""
+        width = width or self.BOX_WRAP_WIDTH
+        width = max(10, min(width, 60))
+
+        words = text.split()
+        lines, current = [], ""
+        for word in words:
+            candidate = (current + " " + word).strip()
+            if len(candidate) > width:
+                if current:
+                    lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        if not lines:
+            lines = [""]
+
+        inner_width = max(len(ln) for ln in lines)
+        top = "+" + "-" * (inner_width + 2) + "+"
+        body = "\n".join(f"| {ln.ljust(inner_width)} |" for ln in lines)
+        return f"{top}\n{body}\n{top}"
+
+
+# --- MarkdownTableFormatter (from 29_markdown_table.py) ---
+class MarkdownTableFormatter:
+    @staticmethod
+    def _parse_rows(raw_text: str):
+        lines = [ln for ln in raw_text.strip().splitlines() if ln.strip()]
+        if not lines:
+            return []
+        # sniff whether this is actually pipe-delimited (someone typed
+        # "Name | Age" style input) vs comma-delimited CSV
+        delimiter = "|" if lines[0].count("|") >= lines[0].count(",") and "|" in lines[0] else ","
+        reader = csv.reader(io.StringIO("\n".join(lines)), delimiter=delimiter, skipinitialspace=True)
+        return [[cell.strip() for cell in row] for row in reader if row]
+
+    @staticmethod
+    def _is_numeric_column(rows, col_index):
+        values = [row[col_index] for row in rows if col_index < len(row) and row[col_index]]
+        if not values:
+            return False
+        for v in values:
+            try:
+                float(v.replace(",", ""))
+            except ValueError:
+                return False
+        return True
+
+    def format_table(self, raw_text: str, alignments=None) -> str:
+        rows = self._parse_rows(raw_text)
+        if len(rows) < 2:
+            return "Give me at least a header row and one data row (comma or pipe separated)."
+
+        width = len(rows[0])
+        rows = [r + [""] * (width - len(r)) if len(r) < width else r[:width] for r in rows]
+        header, body = rows[0], rows[1:]
+
+        if alignments is None:
+            alignments = ["right" if self._is_numeric_column(body, i) else "left" for i in range(width)]
+        else:
+            alignments = (alignments + ["left"] * width)[:width]
+
+        col_widths = [max(len(header[i]), max((len(r[i]) for r in body), default=0)) for i in range(width)]
+
+        def pad(cell, i):
+            w = col_widths[i]
+            if alignments[i] == "right":
+                return cell.rjust(w)
+            elif alignments[i] == "center":
+                return cell.center(w)
+            return cell.ljust(w)
+
+        def sep_cell(i):
+            w = col_widths[i]
+            if alignments[i] == "right":
+                return "-" * (w - 1) + ":" if w > 1 else ":"
+            elif alignments[i] == "center":
+                return ":" + "-" * max(w - 2, 1) + ":"
+            return "-" * w
+
+        out = ["| " + " | ".join(pad(header[i], i) for i in range(width)) + " |",
+               "| " + " | ".join(sep_cell(i) for i in range(width)) + " |"]
+        for r in body:
+            out.append("| " + " | ".join(pad(r[i], i) for i in range(width)) + " |")
+        return "\n".join(out)
+
+    def format_checklist(self, raw_text: str) -> str:
+        lines = [ln.strip() for ln in raw_text.strip().splitlines() if ln.strip()]
+        if not lines:
+            return "Give me one item per line to turn into a checklist."
+        return "\n".join(f"- [ ] {ln}" for ln in lines)
+
+
+# --- CountdownDashboard (from 30_countdown_dashboard.py) ---
+class CountdownDashboard:
+    def __init__(self, memory):
+        self.memory = memory
+        self._categories = {}          # label -> category string (session-only)
+        self._recurring = {}           # label -> (start_date, interval_days)
+
+    @staticmethod
+    def _next_occurrence(month: int, day: int, year, today: dt.date):
+        """If a year was explicitly stored, count down to that exact
+        date (a one-off event, possibly in the past). Otherwise treat
+        it as annual and always return the next upcoming occurrence."""
+        if year:
+            try:
+                return dt.date(year, month, day)
+            except ValueError:
+                return None
+        for candidate_year in (today.year, today.year + 1):
+            try:
+                candidate = dt.date(candidate_year, month, day)
+            except ValueError:
+                continue
+            if candidate >= today:
+                return candidate
+        return None
+
+    @staticmethod
+    def _next_recurring_occurrence(start: dt.date, interval_days: int, today: dt.date):
+        if interval_days <= 0:
+            return None
+        days_since_start = (today - start).days
+        if days_since_start < 0:
+            return start
+        cycles_elapsed = days_since_start // interval_days
+        candidate = start + dt.timedelta(days=cycles_elapsed * interval_days)
+        if candidate < today:
+            candidate += dt.timedelta(days=interval_days)
+        return candidate
+
+    def add(self, label: str, date: dt.date, category: str = None) -> str:
+        self.memory.remember_important_date(label, date)
+        if category:
+            self._categories[label] = category
+        cat_note = f" (category: {category})" if category else ""
+        return f"Got it - I'll track '{label}' ({date.strftime('%B %-d')}){cat_note}."
+
+    def add_recurring(self, label: str, start: dt.date, interval_days: int, category: str = None) -> str:
+        if interval_days <= 0:
+            return "The repeat interval needs to be at least 1 day."
+        self._recurring[label] = (start, interval_days)
+        if category:
+            self._categories[label] = category
+        cat_note = f" (category: {category})" if category else ""
+        return f"Got it - I'll track '{label}' every {interval_days} days, starting {start.strftime('%B %-d, %Y')}{cat_note}."
+
+    def remove(self, label: str) -> str:
+        removed = self.memory.forget_important_date(label)
+        was_recurring = self._recurring.pop(label, None) is not None
+        self._categories.pop(label, None)
+        if removed or was_recurring:
+            return f"Removed '{label}' from your countdowns."
+        return f"I didn't have a countdown called '{label}'."
+
+    def _format_entry(self, label, occurrence, today, category=None):
+        days_left = (occurrence - today).days
+        if days_left == 0:
+            when = "today!"
+        elif days_left == 1:
+            when = "tomorrow"
+        elif days_left < 0:
+            when = f"{abs(days_left)} days ago"
+        else:
+            when = f"in {days_left} days"
+        cat_note = f" [{category}]" if category else ""
+        return days_left, f"  - {label}{cat_note}: {occurrence.strftime('%B %-d')} ({when})"
+
+    def dashboard(self, today: dt.date = None, category_filter: str = None) -> str:
+        today = today or dt.date.today()
+        entries = []
+
+        for row in self.memory.list_important_dates():
+            label, month, day, year = row["label"], row["month"], row["day"], row["year"]
+            if label in self._recurring:
+                continue  # recurring entries are handled below instead
+            category = self._categories.get(label)
+            if category_filter and category != category_filter:
+                continue
+            occurrence = self._next_occurrence(month, day, year, today)
+            if occurrence is None:
+                continue
+            days_left, line = self._format_entry(label, occurrence, today, category)
+            entries.append((days_left, line))
+
+        for label, (start, interval_days) in self._recurring.items():
+            category = self._categories.get(label)
+            if category_filter and category != category_filter:
+                continue
+            occurrence = self._next_recurring_occurrence(start, interval_days, today)
+            if occurrence is None:
+                continue
+            days_left, line = self._format_entry(label, occurrence, today, category)
+            entries.append((days_left, line))
+
+        if not entries:
+            if category_filter:
+                return f"No countdowns tagged '{category_filter}'."
+            return "You don't have any countdowns yet - say 'countdown to <label> on <date>' to add one."
+
+        entries.sort(key=lambda e: e[0])
+        header = f"Your countdowns" + (f" tagged '{category_filter}'" if category_filter else "") + ":"
+        return "\n".join([header] + [line for _, line in entries])
+
+
+# --- AnagramSolver (from 31_word_games.py) ---
+class AnagramSolver:
+    def __init__(self, word_pool):
+        self._words = sorted({w.lower() for w in word_pool if w.isalpha()})
+        self._by_key = {}
+        for w in self._words:
+            key = "".join(sorted(w))
+            self._by_key.setdefault(key, set()).add(w)
+        # only words short enough that a two-word search is tractable
+        self._short_words = [w for w in self._words if 2 <= len(w) <= 8]
+
+    def find(self, word: str, limit: int = 10):
+        key = "".join(sorted(word.lower()))
+        matches = sorted(m for m in self._by_key.get(key, set()) if m != word.lower())
+        if not matches:
+            return f"I couldn't find any anagrams of '{word}' in my word list."
+        shown = matches[:limit]
+        extra = f" (+{len(matches) - limit} more)" if len(matches) > limit else ""
+        return f"Anagrams of '{word}': {', '.join(shown)}{extra}"
+
+    def find_phrase(self, text: str, limit: int = 5):
+        """Finds pairs of dictionary words whose combined letters are
+        exactly an anagram of `text` - a genuinely different (and
+        combinatorially larger) search than single-word anagrams: for
+        each candidate first word that's a "sub-multiset" of the
+        target letters, check whether the LEFTOVER letters exactly
+        match some other dictionary word."""
+        target = Counter(ch for ch in text.lower() if ch.isalpha())
+        if not target:
+            return "Give me some letters to find a phrase anagram for."
+        total_letters = sum(target.values())
+        if total_letters > 18:
+            return "That's too many letters for a phrase-anagram search - try something shorter."
+
+        results = []
+        seen_pairs = set()
+        for w1 in self._short_words:
+            c1 = Counter(w1)
+            if any(c1[ch] > target[ch] for ch in c1):
+                continue
+            remainder = target - c1
+            if not remainder:
+                continue  # w1 alone already covers everything; handled by find()
+            remainder_key = "".join(sorted(remainder.elements()))
+            for w2 in self._by_key.get(remainder_key, set()):
+                pair = tuple(sorted((w1, w2)))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                results.append(f"{w1} {w2}")
+                if len(results) >= limit:
+                    break
+            if len(results) >= limit:
+                break
+
+        if not results:
+            return f"I couldn't find a two-word phrase anagram of '{text}' in my word list."
+        return f"Phrase anagrams of '{text}': " + "; ".join(results)
+
+
+# --- UrgencyClassifier (from 32_deep_networks.py) ---
+class UrgencyClassifier(_DeepDenseTextClassifier):
+    """How time-sensitive a message seems (low/medium/high) - could be
+    used to prioritize to-do items or flag messages worth a faster
+    reply, though it's currently exposed mainly via 'how urgent is
+    this' for direct use."""
+
+    def __init__(self):
+        super().__init__(URGENCY_EXAMPLES)
+
+    def format_predict(self, text: str) -> str:
+        label, confidence = self.predict(text)
+        return f"That reads as **{label}** urgency ({confidence:.0%} confidence)."
+
+
+# --- PolitenessClassifier (from 32_deep_networks.py) ---
+class PolitenessClassifier(_DeepDenseTextClassifier):
+    """How something is being asked (polite/neutral/rude) - distinct
+    from SentimentClassifier's mood reading: a message can be negative
+    in sentiment ('I'm having a rough day') while still being polite,
+    or neutral in sentiment while being rude in register ('just do it
+    already'). Register and mood are genuinely separate signals."""
+
+    def __init__(self):
+        super().__init__(POLITENESS_EXAMPLES)
+
+    def format_predict(self, text: str) -> str:
+        label, confidence = self.predict(text)
+        return f"That reads as **{label}** in tone ({confidence:.0%} confidence)."
+
+
+# --- QuestionTypeClassifier (from 32_deep_networks.py) ---
+class QuestionTypeClassifier(_DeepDenseTextClassifier):
+    """Classifies a question's TYPE (yes/no vs what/why/how/who/when/
+    where, or 'other' for non-questions) - useful for tailoring how a
+    fallback response is phrased even when the specific intent isn't
+    recognized (a 'why' question warrants a different fallback tone
+    than a 'when' question)."""
+
+    def __init__(self):
+        super().__init__(QUESTION_TYPE_EXAMPLES)
+
+    def format_predict(self, text: str) -> str:
+        label, confidence = self.predict(text)
+        return f"That looks like a **{label}**-type question ({confidence:.0%} confidence)."
+
+
+# --- TextComplexityRegressor (from 32_deep_networks.py) ---
+class TextComplexityRegressor(_DeepDenseTextRegressor):
+    """Predicts a continuous 0 (very simple) to 1 (very complex)
+    reading-complexity score for a piece of text - a REGRESSION task,
+    not classification, trained on hand-scored examples spanning
+    simple sentences to dense academic/legal prose."""
+
+    def __init__(self):
+        super().__init__(TEXT_COMPLEXITY_EXAMPLES)
+
+    def format_predict(self, text: str) -> str:
+        score = self.predict(text)
+        if score < 0.25:
+            band = "simple"
+        elif score < 0.6:
+            band = "moderate"
+        else:
+            band = "complex"
+        return f"Estimated reading complexity: {score:.2f} ({band})."
+
+
+# --- EmojiPredictor (from 32_deep_networks.py) ---
+class EmojiPredictor(_DeepDenseTextClassifier):
+    """Predicts which single emoji best fits the emotional content of
+    a message - complements SentimentClassifier's coarser 3-way mood
+    reading with a finer-grained, 7-way emotional category."""
+
+    _EMOJI_MAP = {
+        "happy": "😊", "sad": "😢", "love": "❤️", "laugh": "😂",
+        "angry": "😠", "surprised": "😲", "neutral": "🙂",
+    }
+
+    def __init__(self):
+        super().__init__(EMOJI_EXAMPLES)
+
+    def predict_emoji(self, text: str):
+        """Returns (emoji_char, label, confidence)."""
+        label, confidence = self.predict(text)
+        return self._EMOJI_MAP.get(label, ""), label, confidence
+
+    def format_predict(self, text: str) -> str:
+        emoji, label, confidence = self.predict_emoji(text)
+        return f"That feels {label} to me {emoji} ({confidence:.0%} confidence)."
+
+
+# --- _shared_rest_client (support, from 17_api_connectors.py) ---
+_shared_rest_client = _RestApiClient()
+
+
 
 class ChatBot:
     """

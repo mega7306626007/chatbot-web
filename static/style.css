@@ -10,10 +10,6 @@
 * { box-sizing: border-box; }
 
 body {
-  background-image: url("/static/lionking.jpg");
-  background-size: cover;
-  background-position: center;
-  background-repeat: no-repeat;
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--wa-wallpaper);
@@ -27,8 +23,12 @@ body {
 
 .chat-app {
   width: 100%;
-  
+  max-width: 480px;
   background: #fff;
+  background-image: url("/static/lionking.jpg");
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
   display: flex;
   flex-direction: column;
   height: 100vh;
