@@ -26269,7 +26269,7 @@ class ChatBot:
         # fail-closed guarantee.
         self.llm = LLMConnector(LLM_CONFIG_FILE)
         self.image_analyzer = ImageAnalyzer()
-        self.shape_classifier = ShapeClassifier()
+       
         # Tracks (user_text, predicted_label) for the most recent message
         # the neural classifier guessed on, so a follow-up correction
         # ("no, i meant X") knows exactly what to fix.

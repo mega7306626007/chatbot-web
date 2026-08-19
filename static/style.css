@@ -23,7 +23,6 @@ body {
 
 .chat-app {
   width: 100%;
-  max-width: 480px;
   background: #fff;
   background-image: url("/static/lionking.jpg");
   background-size: cover;
