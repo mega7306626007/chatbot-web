@@ -1,26 +1,31 @@
-# Offline Multilingual Chatbot
+# Offline Multilingual Chatbot — Web
 
-> A modular Python chatbot with offline-first conversation, multilingual support, games, tools, memory, optional ML, and optional LLM fallback.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white" />
+  <img src="https://img.shields.io/badge/Flask-000000?style=for-the-badge&logo=flask&logoColor=white" />
+  <img src="https://img.shields.io/badge/Offline--First-238636?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/Status-Active_Development-ff5e6c?style=for-the-badge" />
+</p>
+
+> **A modular Python chatbot with offline-first conversation, multilingual support, games, tools, memory, optional ML, and optional LLM fallback.**
 
 This project grew from a lightweight Android/Pydroid chatbot into a modular Python system with a clear separation between conversational handlers, intent processing, memory, tools, and optional intelligence backends.
 
 ## Highlights
 
-- 🌍 English, Kiswahili, and French
-- 🧠 Rule-based intent engine with optional ML backends
-- 💬 Conversation memory and tone tracking
-- ✍️ Creative writing: poems, stories, jokes, riddles and more
-- 🎮 Games and learning utilities
-- 🧰 Math, conversions, text tools, QR generation and other utilities
-- 👁️ Optional computer-vision features
-- 🎙️ Offline voice input through Vosk
-- 🧩 Optional PyTorch/Keras/scikit-learn integrations
-- 🔌 Optional Claude/GPT fallback — never required for core operation
-- 📱 Designed to retain an offline path for Android/Pydroid 3
+- English, Kiswahili, and French
+- Rule-based intent engine with optional ML backends
+- Conversation memory and tone tracking
+- Creative writing: poems, stories, jokes, riddles and more
+- Games and learning utilities
+- Math, conversions, text tools, QR generation and other utilities
+- Optional computer-vision features
+- Offline voice input through Vosk
+- Optional PyTorch/Keras/scikit-learn integrations
+- Optional Claude/GPT fallback — never required for core operation
+- Designed to retain an offline path for Android/Pydroid 3
 
 ## Architecture
-
-The project has two complementary entry points:
 
 ```text
 chatbot_modules/
@@ -44,20 +49,6 @@ src/chatbot/
           │
           └── clean Python imports
 ```
-
-The numbered-module structure is deliberate: it preserves the original Pydroid 3 execution model. The `src/chatbot` package provides a cleaner installable interface without duplicating the underlying source.
-
-## Design
-
-The chatbot is composed rather than treated as one giant conversational class. The major handler groups cover:
-
-- System behaviour
-- Creative generation
-- Games
-- Memory
-- Tools
-
-Response-bank files contain multilingual response data and account for a large part of the repository size; they are data, not equivalent amounts of application logic.
 
 ## Installation
 
@@ -118,19 +109,9 @@ pytest
 
 The test suite covers core intent handling, typo correction, database behaviour, creative generators and response-bank integrity.
 
-## Extending the Bot
-
-To add an intent:
-
-1. Put the handler in the appropriate composed handler group.
-2. Register the intent in the chatbot's intent registry.
-3. Add accuracy cases.
-4. Add a focused automated test where appropriate.
-5. Add multilingual response data when the feature requires it.
-
 ## Project Status
 
-🚧 **Active development**
+**Active development**
 
 The project is intentionally modular and experimental. Optional capabilities may require additional dependencies or local models.
 
